@@ -3,6 +3,7 @@ use crate::back::write::to_llvm_code_model;
 use crate::callee::get_fn;
 use crate::coverageinfo;
 use crate::debuginfo;
+use crate::debuginfo::metadata::apply_vcall_visibility_metadata;
 use crate::llvm;
 use crate::llvm_util;
 use crate::type_::Type;
@@ -43,7 +44,6 @@ use std::str;
 /// All other LLVM data structures in the `CodegenCx` are tied to that `llvm::Context`.
 pub struct CodegenCx<'ll, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    pub check_overflow: bool,
     pub use_dll_storage_attrs: bool,
     pub tls_model: llvm::ThreadLocalMode,
 
@@ -139,6 +139,14 @@ pub unsafe fn create_module<'ll>(
             // Earlier LLVMs leave this default, so remove it.
             // See https://github.com/llvm/llvm-project/pull/90702
             target_data_layout = target_data_layout.replace("-Fn32", "");
+        }
+    }
+
+    if llvm_version < (19, 0, 0) {
+        if sess.target.arch == "loongarch64" {
+            // LLVM 19 updates the LoongArch64 data layout.
+            // See https://github.com/llvm/llvm-project/pull/93814
+            target_data_layout = target_data_layout.replace("-n32:64", "-n64");
         }
     }
 
@@ -433,8 +441,6 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         // start) and then strongly recommending static linkage on Windows!
         let use_dll_storage_attrs = tcx.sess.target.is_like_windows;
 
-        let check_overflow = tcx.sess.overflow_checks();
-
         let tls_model = to_llvm_tls_model(tcx.sess.tls_model());
 
         let (llcx, llmod) = (&*llvm_module.llcx, llvm_module.llmod());
@@ -458,7 +464,6 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
 
         CodegenCx {
             tcx,
-            check_overflow,
             use_dll_storage_attrs,
             tls_model,
             llmod,
@@ -512,6 +517,15 @@ impl<'ll, 'tcx> MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), &'ll Value>>
     {
         &self.vtables
+    }
+
+    fn apply_vcall_visibility_metadata(
+        &self,
+        ty: Ty<'tcx>,
+        poly_trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
+        vtable: &'ll Value,
+    ) {
+        apply_vcall_visibility_metadata(self, ty, poly_trait_ref, vtable);
     }
 
     fn get_fn(&self, instance: Instance<'tcx>) -> &'ll Value {
@@ -586,10 +600,6 @@ impl<'ll, 'tcx> MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
     fn sess(&self) -> &Session {
         self.tcx.sess
-    }
-
-    fn check_overflow(&self) -> bool {
-        self.check_overflow
     }
 
     fn codegen_unit(&self) -> &'tcx CodegenUnit<'tcx> {

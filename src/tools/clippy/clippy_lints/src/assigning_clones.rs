@@ -1,16 +1,18 @@
 use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::HirNode;
+use clippy_utils::mir::{enclosing_mir, PossibleBorrowerMap};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::{is_trait_method, path_to_local};
+use clippy_utils::{is_trait_method, local_is_initialized, path_to_local};
 use rustc_errors::Applicability;
-use rustc_hir::{self as hir, Expr, ExprKind, Node};
+use rustc_hir::{self as hir, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::mir;
 use rustc_middle::ty::{self, Instance, Mutability};
 use rustc_session::impl_lint_pass;
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::sym;
-use rustc_span::ExpnKind;
+use rustc_span::{ExpnKind, Span, SyntaxContext};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -36,6 +38,7 @@ declare_clippy_lint! {
     /// Use instead:
     /// ```rust
     /// struct Thing;
+    ///
     /// impl Clone for Thing {
     ///     fn clone(&self) -> Self { todo!() }
     ///     fn clone_from(&mut self, other: &Self) { todo!() }
@@ -47,7 +50,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.78.0"]
     pub ASSIGNING_CLONES,
-    perf,
+    pedantic,
     "assigning the result of cloning may be inefficient"
 }
 
@@ -67,7 +70,8 @@ impl_lint_pass!(AssigningClones => [ASSIGNING_CLONES]);
 impl<'tcx> LateLintPass<'tcx> for AssigningClones {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, assign_expr: &'tcx Expr<'_>) {
         // Do not fire the lint in macros
-        let expn_data = assign_expr.span().ctxt().outer_expn_data();
+        let ctxt = assign_expr.span().ctxt();
+        let expn_data = ctxt.outer_expn_data();
         match expn_data.kind {
             ExpnKind::AstPass(_) | ExpnKind::Desugaring(_) | ExpnKind::Macro(..) => return,
             ExpnKind::Root => {},
@@ -82,7 +86,7 @@ impl<'tcx> LateLintPass<'tcx> for AssigningClones {
         };
 
         if is_ok_to_suggest(cx, lhs, &call, &self.msrv) {
-            suggest(cx, assign_expr, lhs, &call);
+            suggest(cx, ctxt, assign_expr, lhs, &call);
         }
     }
 
@@ -142,6 +146,7 @@ fn extract_call<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Option<
     };
 
     Some(CallCandidate {
+        span: expr.span,
         target,
         kind,
         method_def_id: resolved_method.def_id(),
@@ -163,9 +168,7 @@ fn is_ok_to_suggest<'tcx>(cx: &LateContext<'tcx>, lhs: &Expr<'tcx>, call: &CallC
         // TODO: This check currently bails if the local variable has no initializer.
         // That is overly conservative - the lint should fire even if there was no initializer,
         // but the variable has been initialized before `lhs` was evaluated.
-        if let Some(Node::LetStmt(local)) = cx.tcx.hir().parent_id_iter(local).next().map(|p| cx.tcx.hir_node(p))
-            && local.init.is_none()
-        {
+        if !local_is_initialized(cx, local) {
             return false;
         }
     }
@@ -215,6 +218,10 @@ fn is_ok_to_suggest<'tcx>(cx: &LateContext<'tcx>, lhs: &Expr<'tcx>, call: &CallC
         return false;
     };
 
+    if clone_source_borrows_from_dest(cx, lhs, call.span) {
+        return false;
+    }
+
     // Now take a look if the impl block defines an implementation for the method that we're interested
     // in. If not, then we're using a default implementation, which is not interesting, so we will
     // not suggest the lint.
@@ -222,14 +229,88 @@ fn is_ok_to_suggest<'tcx>(cx: &LateContext<'tcx>, lhs: &Expr<'tcx>, call: &CallC
     implemented_fns.contains_key(&provided_fn.def_id)
 }
 
-fn suggest<'tcx>(cx: &LateContext<'tcx>, assign_expr: &Expr<'tcx>, lhs: &Expr<'tcx>, call: &CallCandidate<'tcx>) {
+/// Checks if the data being cloned borrows from the place that is being assigned to:
+///
+/// ```
+/// let mut s = String::new();
+/// let s2 = &s;
+/// s = s2.to_owned();
+/// ```
+///
+/// This cannot be written `s2.clone_into(&mut s)` because it has conflicting borrows.
+fn clone_source_borrows_from_dest(cx: &LateContext<'_>, lhs: &Expr<'_>, call_span: Span) -> bool {
+    /// If this basic block only exists to drop a local as part of an assignment, returns its
+    /// successor. Otherwise returns the basic block that was passed in.
+    fn skip_drop_block(mir: &mir::Body<'_>, bb: mir::BasicBlock) -> mir::BasicBlock {
+        if let mir::TerminatorKind::Drop { target, .. } = mir.basic_blocks[bb].terminator().kind {
+            target
+        } else {
+            bb
+        }
+    }
+
+    let Some(mir) = enclosing_mir(cx.tcx, lhs.hir_id) else {
+        return false;
+    };
+    let PossibleBorrowerMap { map: borrow_map, .. } = PossibleBorrowerMap::new(cx, mir);
+
+    // The operation `dest = src.to_owned()` in MIR is split up across 3 blocks *if* the type has `Drop`
+    // code. For types that don't, the second basic block is simply skipped.
+    // For the doc example above that would be roughly:
+    //
+    // bb0:
+    //  s2 = &s
+    //  s_temp = ToOwned::to_owned(move s2) -> bb1
+    //
+    // bb1:
+    //  drop(s) -> bb2  // drop the old string
+    //
+    // bb2:
+    //  s = s_temp
+    for bb in mir.basic_blocks.iter() {
+        let terminator = bb.terminator();
+
+        // Look for the to_owned/clone call.
+        if terminator.source_info.span != call_span {
+            continue;
+        }
+
+        if let mir::TerminatorKind::Call { ref args, target: Some(assign_bb), .. } = terminator.kind
+            && let [source] = &**args
+            && let mir::Operand::Move(source) = &source.node
+            && let assign_bb = skip_drop_block(mir, assign_bb)
+            // Skip any storage statements as they are just noise
+            && let Some(assignment) = mir.basic_blocks[assign_bb].statements
+                .iter()
+                .find(|stmt| {
+                    !matches!(stmt.kind, mir::StatementKind::StorageDead(_) | mir::StatementKind::StorageLive(_))
+                })
+            && let mir::StatementKind::Assign(box (borrowed, _)) = &assignment.kind
+            && let Some(borrowers) = borrow_map.get(&borrowed.local)
+            && borrowers.contains(source.local)
+        {
+            return true;
+        }
+
+        return false;
+    }
+    false
+}
+
+fn suggest<'tcx>(
+    cx: &LateContext<'tcx>,
+    ctxt: SyntaxContext,
+    assign_expr: &Expr<'tcx>,
+    lhs: &Expr<'tcx>,
+    call: &CallCandidate<'tcx>,
+) {
     span_lint_and_then(cx, ASSIGNING_CLONES, assign_expr.span, call.message(), |diag| {
         let mut applicability = Applicability::Unspecified;
 
         diag.span_suggestion(
             assign_expr.span,
             call.suggestion_msg(),
-            call.suggested_replacement(cx, lhs, &mut applicability),
+            call.suggested_replacement(cx, ctxt, lhs, &mut applicability),
             applicability,
         );
     });
@@ -249,6 +330,7 @@ enum TargetTrait {
 
 #[derive(Debug)]
 struct CallCandidate<'tcx> {
+    span: Span,
     target: TargetTrait,
     kind: CallKind<'tcx>,
     // DefId of the called method from an impl block that implements the target trait
@@ -275,6 +357,7 @@ impl<'tcx> CallCandidate<'tcx> {
     fn suggested_replacement(
         &self,
         cx: &LateContext<'tcx>,
+        ctxt: SyntaxContext,
         lhs: &Expr<'tcx>,
         applicability: &mut Applicability,
     ) -> String {
@@ -294,7 +377,7 @@ impl<'tcx> CallCandidate<'tcx> {
                         // Determine whether we need to reference the argument to clone_from().
                         let clone_receiver_type = cx.typeck_results().expr_ty(receiver);
                         let clone_receiver_adj_type = cx.typeck_results().expr_ty_adjusted(receiver);
-                        let mut arg_sugg = Sugg::hir_with_applicability(cx, receiver, "_", applicability);
+                        let mut arg_sugg = Sugg::hir_with_context(cx, receiver, ctxt, "_", applicability);
                         if clone_receiver_type != clone_receiver_adj_type {
                             // The receiver may have been a value type, so we need to add an `&` to
                             // be sure the argument to clone_from will be a reference.
@@ -312,7 +395,7 @@ impl<'tcx> CallCandidate<'tcx> {
                             Sugg::hir_with_applicability(cx, lhs, "_", applicability).mut_addr()
                         };
                         // The RHS had to be exactly correct before the call, there is no auto-deref for function calls.
-                        let rhs_sugg = Sugg::hir_with_applicability(cx, self_arg, "_", applicability);
+                        let rhs_sugg = Sugg::hir_with_context(cx, self_arg, ctxt, "_", applicability);
 
                         format!("Clone::clone_from({self_sugg}, {rhs_sugg})")
                     },
@@ -341,11 +424,11 @@ impl<'tcx> CallCandidate<'tcx> {
 
                 match self.kind {
                     CallKind::MethodCall { receiver } => {
-                        let receiver_sugg = Sugg::hir_with_applicability(cx, receiver, "_", applicability);
+                        let receiver_sugg = Sugg::hir_with_context(cx, receiver, ctxt, "_", applicability);
                         format!("{receiver_sugg}.clone_into({rhs_sugg})")
                     },
                     CallKind::FunctionCall { self_arg, .. } => {
-                        let self_sugg = Sugg::hir_with_applicability(cx, self_arg, "_", applicability);
+                        let self_sugg = Sugg::hir_with_context(cx, self_arg, ctxt, "_", applicability);
                         format!("ToOwned::clone_into({self_sugg}, {rhs_sugg})")
                     },
                 }

@@ -6,11 +6,12 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::HirId;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::middle::stability::EvalResult;
-use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{self, Const};
 use rustc_middle::thir::{self, FieldPat, Pat, PatKind, PatRange, PatRangeBoundary};
 use rustc_middle::ty::layout::IntegerExt;
-use rustc_middle::ty::{self, FieldDef, OpaqueTypeKey, Ty, TyCtxt, TypeVisitableExt, VariantDef};
+use rustc_middle::ty::{
+    self, FieldDef, OpaqueTypeKey, ScalarInt, Ty, TyCtxt, TypeVisitableExt, VariantDef,
+};
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint;
 use rustc_span::{ErrorGuaranteed, Span, DUMMY_SP};
@@ -246,8 +247,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 }
                 _ => bug!("bad slice pattern {:?} {:?}", ctor, ty),
             },
-            Bool(..) | IntRange(..) | F32Range(..) | F64Range(..) | Str(..) | Opaque(..)
-            | Never | NonExhaustive | Hidden | Missing | PrivateUninhabited | Wildcard => &[],
+            Bool(..) | IntRange(..) | F16Range(..) | F32Range(..) | F64Range(..)
+            | F128Range(..) | Str(..) | Opaque(..) | Never | NonExhaustive | Hidden | Missing
+            | PrivateUninhabited | Wildcard => &[],
             Or => {
                 bug!("called `Fields::wildcards` on an `Or` ctor")
             }
@@ -274,8 +276,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
             },
             Ref => 1,
             Slice(slice) => slice.arity(),
-            Bool(..) | IntRange(..) | F32Range(..) | F64Range(..) | Str(..) | Opaque(..)
-            | Never | NonExhaustive | Hidden | Missing | PrivateUninhabited | Wildcard => 0,
+            Bool(..) | IntRange(..) | F16Range(..) | F32Range(..) | F64Range(..)
+            | F128Range(..) | Str(..) | Opaque(..) | Never | NonExhaustive | Hidden | Missing
+            | PrivateUninhabited | Wildcard => 0,
             Or => bug!("The `Or` constructor doesn't have a fixed arity"),
         }
     }
@@ -545,6 +548,18 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                         fields = vec![];
                         arity = 0;
                     }
+                    ty::Float(ty::FloatTy::F16) => {
+                        ctor = match value.try_eval_bits(cx.tcx, cx.param_env) {
+                            Some(bits) => {
+                                use rustc_apfloat::Float;
+                                let value = rustc_apfloat::ieee::Half::from_bits(bits);
+                                F16Range(value, value, RangeEnd::Included)
+                            }
+                            None => Opaque(OpaqueId::new()),
+                        };
+                        fields = vec![];
+                        arity = 0;
+                    }
                     ty::Float(ty::FloatTy::F32) => {
                         ctor = match value.try_eval_bits(cx.tcx, cx.param_env) {
                             Some(bits) => {
@@ -563,6 +578,18 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                                 use rustc_apfloat::Float;
                                 let value = rustc_apfloat::ieee::Double::from_bits(bits);
                                 F64Range(value, value, RangeEnd::Included)
+                            }
+                            None => Opaque(OpaqueId::new()),
+                        };
+                        fields = vec![];
+                        arity = 0;
+                    }
+                    ty::Float(ty::FloatTy::F128) => {
+                        ctor = match value.try_eval_bits(cx.tcx, cx.param_env) {
+                            Some(bits) => {
+                                use rustc_apfloat::Float;
+                                let value = rustc_apfloat::ieee::Quad::from_bits(bits);
+                                F128Range(value, value, RangeEnd::Included)
                             }
                             None => Opaque(OpaqueId::new()),
                         };
@@ -610,7 +637,12 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                         let lo = lo.as_finite().map(|c| c.eval_bits(cx.tcx, cx.param_env));
                         let hi = hi.as_finite().map(|c| c.eval_bits(cx.tcx, cx.param_env));
                         match fty {
-                            ty::FloatTy::F16 => unimplemented!("f16_f128"),
+                            ty::FloatTy::F16 => {
+                                use rustc_apfloat::ieee::Half;
+                                let lo = lo.map(Half::from_bits).unwrap_or(-Half::INFINITY);
+                                let hi = hi.map(Half::from_bits).unwrap_or(Half::INFINITY);
+                                F16Range(lo, hi, end)
+                            }
                             ty::FloatTy::F32 => {
                                 use rustc_apfloat::ieee::Single;
                                 let lo = lo.map(Single::from_bits).unwrap_or(-Single::INFINITY);
@@ -623,7 +655,12 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                                 let hi = hi.map(Double::from_bits).unwrap_or(Double::INFINITY);
                                 F64Range(lo, hi, end)
                             }
-                            ty::FloatTy::F128 => unimplemented!("f16_f128"),
+                            ty::FloatTy::F128 => {
+                                use rustc_apfloat::ieee::Quad;
+                                let lo = lo.map(Quad::from_bits).unwrap_or(-Quad::INFINITY);
+                                let hi = hi.map(Quad::from_bits).unwrap_or(Quad::INFINITY);
+                                F128Range(lo, hi, end)
+                            }
                         }
                     }
                     _ => bug!("invalid type for range pattern: {}", ty.inner()),
@@ -701,9 +738,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                     ty::Int(_) => miint.as_finite_int(size.bits()).unwrap(),
                     _ => miint.as_finite_uint().unwrap(),
                 };
-                match Scalar::try_from_uint(bits, size) {
+                match ScalarInt::try_from_uint(bits, size) {
                     Some(scalar) => {
-                        let value = mir::Const::from_scalar(tcx, scalar, ty.inner());
+                        let value = mir::Const::from_scalar(tcx, scalar.into(), ty.inner());
                         PatRangeBoundary::Finite(value)
                     }
                     // The value doesn't fit. Since `x >= 0` and 0 always encodes the minimum value
@@ -737,7 +774,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 // this). We show this to the user as `usize::MAX..` which is slightly incorrect but
                 // probably clear enough.
                 let c = ty.numeric_max_val(cx.tcx).unwrap();
-                let value = mir::Const::from_ty_const(c, cx.tcx);
+                let value = mir::Const::from_ty_const(c, ty.0, cx.tcx);
                 lo = PatRangeBoundary::Finite(value);
             }
             let hi = if let Some(hi) = range.hi.minus_one() {
@@ -836,7 +873,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 "trying to convert a `Missing` constructor into a `Pat`; this is probably a bug,
                 `Missing` should have been processed in `apply_constructors`"
             ),
-            F32Range(..) | F64Range(..) | Opaque(..) | Or => {
+            F16Range(..) | F32Range(..) | F64Range(..) | F128Range(..) | Opaque(..) | Or => {
                 bug!("can't convert to pattern: {:?}", pat)
             }
         };

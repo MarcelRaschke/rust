@@ -3,11 +3,10 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/method-lookup.html
 
 mod confirm;
-mod prelude2021;
+mod prelude_edition_lints;
 pub mod probe;
 mod suggest;
 
-pub use self::suggest::SelfSource;
 pub use self::MethodError::*;
 
 use crate::FnCtxt;
@@ -22,7 +21,7 @@ use rustc_middle::ty::{self, GenericParamDefKind, Ty, TypeVisitableExt};
 use rustc_middle::ty::{GenericArgs, GenericArgsRef};
 use rustc_middle::{bug, span_bug};
 use rustc_span::symbol::Ident;
-use rustc_span::Span;
+use rustc_span::{sym, Span};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use rustc_trait_selection::traits::{self, NormalizeExt};
 
@@ -186,7 +185,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let pick =
             self.lookup_probe(segment.ident, self_ty, call_expr, ProbeScope::TraitsInScope)?;
 
-        self.lint_dot_call_from_2018(self_ty, segment, span, call_expr, self_expr, &pick, args);
+        self.lint_edition_dependent_dot_call(
+            self_ty, segment, span, call_expr, self_expr, &pick, args,
+        );
 
         for &import_id in &pick.import_ids {
             debug!("used_trait_import: {:?}", import_id);
@@ -332,7 +333,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.var_for_def(cause.span, param)
         });
 
-        let trait_ref = ty::TraitRef::new(self.tcx, trait_def_id, args);
+        let trait_ref = ty::TraitRef::new_from_args(self.tcx, trait_def_id, args);
 
         // Construct an obligation
         let poly_trait_ref = ty::Binder::dummy(trait_ref);
@@ -355,6 +356,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Option<InferOk<'tcx, MethodCallee<'tcx>>> {
         let (obligation, args) =
             self.obligation_for_method(cause, trait_def_id, self_ty, opt_input_types);
+        // FIXME(effects) find a better way to do this
+        // Operators don't have generic methods, but making them `#[const_trait]` gives them
+        // `const host: bool`.
+        let args = if self.tcx.has_attr(trait_def_id, sym::const_trait) {
+            self.tcx.mk_args_from_iter(
+                args.iter()
+                    .chain([self.tcx.expected_host_effect_param_for_body(self.body_id).into()]),
+            )
+        } else {
+            args
+        };
         self.construct_obligation_for_trait(m_name, trait_def_id, obligation, args)
     }
 
@@ -391,6 +403,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         debug!("lookup_in_trait_adjusted: method_item={:?}", method_item);
         let mut obligations = vec![];
+
+        // FIXME(effects): revisit when binops get `#[const_trait]`
 
         // Instantiate late-bound regions and instantiate the trait
         // parameters into the method type to get the actual method type.

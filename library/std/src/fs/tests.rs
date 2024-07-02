@@ -406,7 +406,7 @@ fn file_test_read_buf() {
     let filename = &tmpdir.join("test");
     check!(fs::write(filename, &[1, 2, 3, 4]));
 
-    let mut buf: [MaybeUninit<u8>; 128] = MaybeUninit::uninit_array();
+    let mut buf: [MaybeUninit<u8>; 128] = [MaybeUninit::uninit(); 128];
     let mut buf = BorrowedBuf::from(buf.as_mut_slice());
     let mut file = check!(File::open(filename));
     check!(file.read_buf(buf.unfilled()));
@@ -1431,7 +1431,7 @@ fn metadata_access_times() {
     assert_eq!(check!(a.modified()), check!(a.modified()));
     assert_eq!(check!(b.accessed()), check!(b.modified()));
 
-    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+    if cfg!(target_vendor = "apple") || cfg!(target_os = "windows") {
         check!(a.created());
         check!(b.created());
     }

@@ -154,6 +154,7 @@
 //! }
 //! vec.truncate(write_idx);
 //! ```
+
 use crate::alloc::{handle_alloc_error, Global};
 use core::alloc::Allocator;
 use core::alloc::Layout;
@@ -259,7 +260,8 @@ where
             inner.cap,
             inner.buf.cast::<T>(),
             inner.end as *const T,
-            inner.cap * mem::size_of::<I::Src>() / mem::size_of::<T>(),
+            // SAFETY: the multiplication can not overflow, since `inner.cap * size_of::<I::SRC>()` is the size of the allocation.
+            inner.cap.unchecked_mul(mem::size_of::<I::Src>()) / mem::size_of::<T>(),
         )
     };
 
@@ -374,7 +376,7 @@ where
         // - it lets us thread the write pointer through its innards and get it back in the end
         let sink = InPlaceDrop { inner: dst_buf, dst: dst_buf };
         let sink =
-            self.try_fold::<_, _, Result<_, !>>(sink, write_in_place_with_drop(end)).unwrap();
+            self.try_fold::<_, _, Result<_, !>>(sink, write_in_place_with_drop(end)).into_ok();
         // iteration succeeded, don't drop head
         unsafe { ManuallyDrop::new(sink).dst.sub_ptr(dst_buf) }
     }

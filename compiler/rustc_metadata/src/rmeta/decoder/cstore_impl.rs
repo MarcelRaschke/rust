@@ -191,7 +191,7 @@ impl IntoArgs for (CrateNum, DefId) {
     }
 }
 
-impl<'tcx> IntoArgs for ty::InstanceDef<'tcx> {
+impl<'tcx> IntoArgs for ty::InstanceKind<'tcx> {
     type Other = ();
     fn into_args(self) -> (DefId, ()) {
         (self.def_id(), ())
@@ -211,8 +211,8 @@ provide! { tcx, def_id, other, cdata,
     explicit_predicates_of => { table }
     generics_of => { table }
     inferred_outlives_of => { table_defaulted_array }
-    super_predicates_of => { table }
-    implied_predicates_of => { table }
+    explicit_super_predicates_of => { table }
+    explicit_implied_predicates_of => { table }
     type_of => { table }
     type_alias_is_lazy => { cdata.root.tables.type_alias_is_lazy.get(cdata, def_id.index) }
     variances_of => { table }
@@ -279,6 +279,9 @@ provide! { tcx, def_id, other, cdata,
             .process_decoded(tcx, || panic!("{def_id:?} does not have trait_impl_trait_tys")))
     }
 
+    associated_type_for_effects => {
+        table
+    }
     associated_types_for_impl_traits_in_associated_fn => { table_defaulted_array }
 
     visibility => { cdata.get_visibility(def_id.index) }
@@ -286,6 +289,10 @@ provide! { tcx, def_id, other, cdata,
     adt_destructor => {
         let _ = cdata;
         tcx.calculate_dtor(def_id, |_,_| Ok(()))
+    }
+    adt_async_destructor => {
+        let _ = cdata;
+        tcx.calculate_async_dtor(def_id, |_,_| Ok(()))
     }
     associated_item_def_ids => {
         tcx.arena.alloc_from_iter(cdata.get_associated_item_or_field_def_ids(def_id.index))
@@ -310,6 +317,7 @@ provide! { tcx, def_id, other, cdata,
     extern_crate => { cdata.extern_crate.map(|c| &*tcx.arena.alloc(c)) }
     is_no_builtins => { cdata.root.no_builtins }
     symbol_mangling_version => { cdata.root.symbol_mangling_version }
+    specialization_enabled_in => { cdata.root.specialization_enabled_in }
     reachable_non_generics => {
         let reachable_non_generics = tcx
             .exported_symbols(cdata.cnum)

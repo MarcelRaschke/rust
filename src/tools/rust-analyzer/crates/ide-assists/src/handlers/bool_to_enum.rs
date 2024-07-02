@@ -1,4 +1,4 @@
-use hir::ModuleDef;
+use hir::{ImportPathConfig, ModuleDef};
 use ide_db::{
     assists::{AssistId, AssistKind},
     defs::Definition,
@@ -228,7 +228,7 @@ fn replace_usages(
 
                     edit.replace(
                         prefix_expr.syntax().text_range(),
-                        format!("{} == Bool::False", inner_expr),
+                        format!("{inner_expr} == Bool::False"),
                     );
                 } else if let Some((record_field, initializer)) = name
                     .as_name_ref()
@@ -275,7 +275,7 @@ fn replace_usages(
                 } else if let Some(receiver) = find_method_call_expr_usage(&name) {
                     edit.replace(
                         receiver.syntax().text_range(),
-                        format!("({} == Bool::True)", receiver),
+                        format!("({receiver} == Bool::True)"),
                     );
                 } else if name.syntax().ancestors().find_map(ast::UseTree::cast).is_none() {
                     // for any other usage in an expression, replace it with a check that it is the true variant
@@ -326,6 +326,11 @@ fn augment_references_with_imports(
 ) -> Vec<FileReferenceWithImport> {
     let mut visited_modules = FxHashSet::default();
 
+    let cfg = ImportPathConfig {
+        prefer_no_std: ctx.config.prefer_no_std,
+        prefer_prelude: ctx.config.prefer_prelude,
+    };
+
     references
         .into_iter()
         .filter_map(|FileReference { range, name, .. }| {
@@ -341,12 +346,11 @@ fn augment_references_with_imports(
 
                 let import_scope = ImportScope::find_insert_use_container(name.syntax(), &ctx.sema);
                 let path = ref_module
-                    .find_use_path_prefixed(
+                    .find_use_path(
                         ctx.sema.db,
                         ModuleDef::Module(*target_module),
                         ctx.config.insert_use.prefix_kind,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
+                        cfg,
                     )
                     .map(|mod_path| {
                         make::path_concat(mod_path_to_ast(&mod_path), make::path_from_text("Bool"))
@@ -1521,7 +1525,7 @@ mod foo {
 }
 "#,
             r#"
-use crate::foo::Bool;
+use foo::Bool;
 
 fn main() {
     use foo::FOO;
@@ -1602,7 +1606,7 @@ pub mod bar {
 "#,
             r#"
 //- /main.rs
-use crate::foo::bar::Bool;
+use foo::bar::Bool;
 
 mod foo;
 

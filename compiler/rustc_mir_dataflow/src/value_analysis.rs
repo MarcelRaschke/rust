@@ -45,6 +45,7 @@ use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_target::abi::{FieldIdx, VariantIdx};
+use tracing::debug;
 
 use crate::lattice::{HasBottom, HasTop};
 use crate::{
@@ -184,7 +185,6 @@ pub trait ValueAnalysis<'tcx> {
             | Rvalue::Len(..)
             | Rvalue::Cast(..)
             | Rvalue::BinaryOp(..)
-            | Rvalue::CheckedBinaryOp(..)
             | Rvalue::NullaryOp(..)
             | Rvalue::UnaryOp(..)
             | Rvalue::Discriminant(..)
@@ -846,9 +846,10 @@ impl Map {
 
         if let ty::Ref(_, ref_ty, _) | ty::RawPtr(ref_ty, _) = ty.kind()
             && let ty::Slice(..) = ref_ty.kind()
+            // The user may have written a predicate like `[T]: Sized` in their where clauses,
+            // which makes slices scalars.
+            && self.places[place].value_index.is_none()
         {
-            assert!(self.places[place].value_index.is_none(), "slices are not scalars");
-
             // Prepend new child to the linked list.
             let len = self.places.push(PlaceInfo::new(Some(TrackElem::DerefLen)));
             self.places[len].next_sibling = self.places[place].first_child;

@@ -363,7 +363,7 @@ impl MirEvalError {
                         )?;
                     }
                     Either::Right(closure) => {
-                        writeln!(f, "In {:?}", closure)?;
+                        writeln!(f, "In {closure:?}")?;
                     }
                 }
                 let source_map = db.body_with_source_map(*def).1;
@@ -424,9 +424,20 @@ impl MirEvalError {
             | MirEvalError::StackOverflow
             | MirEvalError::CoerceUnsizedError(_)
             | MirEvalError::InternalError(_)
-            | MirEvalError::InvalidVTableId(_) => writeln!(f, "{:?}", err)?,
+            | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,
         }
         Ok(())
+    }
+
+    pub fn is_panic(&self) -> Option<&str> {
+        let mut err = self;
+        while let MirEvalError::InFunction(e, _) = err {
+            err = e;
+        }
+        match err {
+            MirEvalError::Panic(msg) => Some(msg),
+            _ => None,
+        }
     }
 }
 
@@ -1138,7 +1149,7 @@ impl Evaluator<'_> {
                 let mut ty = self.operand_ty(lhs, locals)?;
                 while let TyKind::Ref(_, _, z) = ty.kind(Interner) {
                     ty = z.clone();
-                    let size = if ty.kind(Interner) == &TyKind::Str {
+                    let size = if ty.is_str() {
                         if *op != BinOp::Eq {
                             never!("Only eq is builtin for `str`");
                         }

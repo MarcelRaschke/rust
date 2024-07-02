@@ -9,11 +9,11 @@ use std::{
 };
 
 use build_helper::ci::CiEnv;
-use build_helper::stage0_parser::VersionMetadata;
 use xz2::bufread::XzDecoder;
 
+use crate::utils::exec::BootstrapCommand;
+use crate::utils::helpers::hex_encode;
 use crate::utils::helpers::{check_run, exe, move_file, program_out_of_date};
-use crate::{core::build_steps::llvm::detect_llvm_sha, utils::helpers::hex_encode};
 use crate::{t, Config};
 
 static SHOULD_FIX_BINS_AND_DYLIBS: OnceLock<bool> = OnceLock::new();
@@ -57,7 +57,7 @@ impl Config {
     /// Runs a command, printing out nice contextual information if it fails.
     /// Returns false if do not execute at all, otherwise returns its
     /// `status.success()`.
-    pub(crate) fn check_run(&self, cmd: &mut Command) -> bool {
+    pub(crate) fn check_run(&self, cmd: &mut BootstrapCommand) -> bool {
         if self.dry_run() {
             return true;
         }
@@ -174,15 +174,10 @@ impl Config {
         }
 
         let mut patchelf = Command::new(nix_deps_dir.join("bin/patchelf"));
-        let rpath_entries = {
-            // ORIGIN is a relative default, all binary and dynamic libraries we ship
-            // appear to have this (even when `../lib` is redundant).
-            // NOTE: there are only two paths here, delimited by a `:`
-            let mut entries = OsString::from("$ORIGIN/../lib:");
-            entries.push(t!(fs::canonicalize(nix_deps_dir)).join("lib"));
-            entries
-        };
-        patchelf.args(&[OsString::from("--set-rpath"), rpath_entries]);
+        patchelf.args(&[
+            OsString::from("--add-rpath"),
+            OsString::from(t!(fs::canonicalize(nix_deps_dir)).join("lib")),
+        ]);
         if !path_is_dylib(fname) {
             // Finally, set the correct .interp for binaries
             let dynamic_linker_path = nix_deps_dir.join("nix-support/dynamic-linker");
@@ -217,7 +212,7 @@ impl Config {
     fn download_http_with_retries(&self, tempfile: &Path, url: &str, help_on_error: &str) {
         println!("downloading {url}");
         // Try curl. If that fails and we are on windows, fallback to PowerShell.
-        let mut curl = Command::new("curl");
+        let mut curl = BootstrapCommand::new("curl");
         curl.args([
             "-y",
             "30",
@@ -405,9 +400,17 @@ impl Config {
         cargo_clippy
     }
 
+    #[cfg(feature = "bootstrap-self-test")]
+    pub(crate) fn maybe_download_rustfmt(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// NOTE: rustfmt is a completely different toolchain than the bootstrap compiler, so it can't
     /// reuse target directories or artifacts
+    #[cfg(not(feature = "bootstrap-self-test"))]
     pub(crate) fn maybe_download_rustfmt(&self) -> Option<PathBuf> {
+        use build_helper::stage0_parser::VersionMetadata;
+
         let VersionMetadata { date, version } = self.stage0_metadata.rustfmt.as_ref()?;
         let channel = format!("{version}-{date}");
 
@@ -487,6 +490,10 @@ impl Config {
         );
     }
 
+    #[cfg(feature = "bootstrap-self-test")]
+    pub(crate) fn download_beta_toolchain(&self) {}
+
+    #[cfg(not(feature = "bootstrap-self-test"))]
     pub(crate) fn download_beta_toolchain(&self) {
         self.verbose(|| println!("downloading stage0 beta artifacts"));
 
@@ -665,7 +672,13 @@ download-rustc = false
         self.unpack(&tarball, &bin_root, prefix);
     }
 
+    #[cfg(feature = "bootstrap-self-test")]
+    pub(crate) fn maybe_download_ci_llvm(&self) {}
+
+    #[cfg(not(feature = "bootstrap-self-test"))]
     pub(crate) fn maybe_download_ci_llvm(&self) {
+        use crate::core::build_steps::llvm::detect_llvm_sha;
+
         if !self.llvm_from_ci {
             return;
         }
@@ -707,6 +720,7 @@ download-rustc = false
         }
     }
 
+    #[cfg(not(feature = "bootstrap-self-test"))]
     fn download_ci_llvm(&self, llvm_sha: &str) {
         let llvm_assertions = self.llvm_assertions;
 

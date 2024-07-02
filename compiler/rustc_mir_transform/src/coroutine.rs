@@ -68,8 +68,8 @@ use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::CoroutineArgs;
-use rustc_middle::ty::InstanceDef;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::InstanceKind;
+use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
 use rustc_mir_dataflow::impls::{
     MaybeBorrowedLocals, MaybeLiveLocals, MaybeRequiresStorage, MaybeStorageLive,
@@ -677,8 +677,8 @@ fn transform_async_context<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
 
 fn eliminate_get_context_call<'tcx>(bb_data: &mut BasicBlockData<'tcx>) -> Local {
     let terminator = bb_data.terminator.take().unwrap();
-    if let TerminatorKind::Call { mut args, destination, target, .. } = terminator.kind {
-        let arg = args.pop().unwrap();
+    if let TerminatorKind::Call { args, destination, target, .. } = terminator.kind {
+        let [arg] = *Box::try_from(args).unwrap();
         let local = arg.node.place().unwrap().local;
 
         let arg = Rvalue::Use(arg.node);
@@ -1276,7 +1276,7 @@ fn create_coroutine_drop_shim<'tcx>(
     // Update the body's def to become the drop glue.
     let coroutine_instance = body.source.instance;
     let drop_in_place = tcx.require_lang_item(LangItem::DropInPlace, None);
-    let drop_instance = InstanceDef::DropGlue(drop_in_place, Some(coroutine_ty));
+    let drop_instance = InstanceKind::DropGlue(drop_in_place, Some(coroutine_ty));
 
     // Temporary change MirSource to coroutine's instance so that dump_mir produces more sensible
     // filename.
@@ -1608,7 +1608,7 @@ fn check_field_tys_sized<'tcx>(
     let infcx = tcx.infer_ctxt().ignoring_regions().build();
     let param_env = tcx.param_env(def_id);
 
-    let ocx = ObligationCtxt::new(&infcx);
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
     for field_ty in &coroutine_layout.field_tys {
         ocx.register_bound(
             ObligationCause::new(

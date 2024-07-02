@@ -249,9 +249,7 @@ pub(crate) fn compile_fn(
     }
 
     // Define debuginfo for function
-    let isa = module.isa();
     let debug_context = &mut cx.debug_context;
-    let unwind_context = &mut cx.unwind_context;
     cx.profiler.generic_activity("generate debug info").run(|| {
         if let Some(debug_context) = debug_context {
             codegened_func.func_debug_cx.unwrap().finalize(
@@ -260,7 +258,6 @@ pub(crate) fn compile_fn(
                 context,
             );
         }
-        unwind_context.add_function(codegened_func.func_id, &context, isa);
     });
 }
 
@@ -548,10 +545,7 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
             }
             TerminatorKind::Drop { place, target, unwind: _, replace: _ } => {
                 let drop_place = codegen_place(fx, *place);
-                crate::abi::codegen_drop(fx, source_info, drop_place);
-
-                let target_block = fx.get_block(*target);
-                fx.bcx.ins().jump(target_block, &[]);
+                crate::abi::codegen_drop(fx, source_info, drop_place, *target);
             }
         };
     }
@@ -609,35 +603,44 @@ fn codegen_stmt<'tcx>(
                     let lhs = codegen_operand(fx, &lhs_rhs.0);
                     let rhs = codegen_operand(fx, &lhs_rhs.1);
 
-                    let res = crate::num::codegen_binop(fx, bin_op, lhs, rhs);
-                    lval.write_cvalue(fx, res);
-                }
-                Rvalue::CheckedBinaryOp(bin_op, ref lhs_rhs) => {
-                    let lhs = codegen_operand(fx, &lhs_rhs.0);
-                    let rhs = codegen_operand(fx, &lhs_rhs.1);
-
-                    let res = crate::num::codegen_checked_int_binop(fx, bin_op, lhs, rhs);
+                    let res = if let Some(bin_op) = bin_op.overflowing_to_wrapping() {
+                        crate::num::codegen_checked_int_binop(fx, bin_op, lhs, rhs)
+                    } else {
+                        crate::num::codegen_binop(fx, bin_op, lhs, rhs)
+                    };
                     lval.write_cvalue(fx, res);
                 }
                 Rvalue::UnaryOp(un_op, ref operand) => {
                     let operand = codegen_operand(fx, operand);
                     let layout = operand.layout();
-                    let val = operand.load_scalar(fx);
                     let res = match un_op {
-                        UnOp::Not => match layout.ty.kind() {
-                            ty::Bool => {
-                                let res = fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0);
-                                CValue::by_val(res, layout)
+                        UnOp::Not => {
+                            let val = operand.load_scalar(fx);
+                            match layout.ty.kind() {
+                                ty::Bool => {
+                                    let res = fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0);
+                                    CValue::by_val(res, layout)
+                                }
+                                ty::Uint(_) | ty::Int(_) => {
+                                    CValue::by_val(fx.bcx.ins().bnot(val), layout)
+                                }
+                                _ => unreachable!("un op Not for {:?}", layout.ty),
                             }
-                            ty::Uint(_) | ty::Int(_) => {
-                                CValue::by_val(fx.bcx.ins().bnot(val), layout)
+                        }
+                        UnOp::Neg => {
+                            let val = operand.load_scalar(fx);
+                            match layout.ty.kind() {
+                                ty::Int(_) => CValue::by_val(fx.bcx.ins().ineg(val), layout),
+                                ty::Float(_) => CValue::by_val(fx.bcx.ins().fneg(val), layout),
+                                _ => unreachable!("un op Neg for {:?}", layout.ty),
                             }
-                            _ => unreachable!("un op Not for {:?}", layout.ty),
-                        },
-                        UnOp::Neg => match layout.ty.kind() {
-                            ty::Int(_) => CValue::by_val(fx.bcx.ins().ineg(val), layout),
-                            ty::Float(_) => CValue::by_val(fx.bcx.ins().fneg(val), layout),
-                            _ => unreachable!("un op Neg for {:?}", layout.ty),
+                        }
+                        UnOp::PtrMetadata => match layout.abi {
+                            Abi::Scalar(_) => CValue::zst(dest_layout),
+                            Abi::ScalarPair(_, _) => {
+                                CValue::by_val(operand.load_scalar_pair(fx).1, dest_layout)
+                            }
+                            _ => bug!("Unexpected `PtrToMetadata` operand: {operand:?}"),
                         },
                     };
                     lval.write_cvalue(fx, res);
@@ -671,20 +674,21 @@ fn codegen_stmt<'tcx>(
                     CastKind::PointerCoercion(PointerCoercion::UnsafeFnPointer),
                     ref operand,
                     to_ty,
-                )
-                | Rvalue::Cast(
-                    CastKind::PointerCoercion(PointerCoercion::MutToConstPointer),
-                    ref operand,
-                    to_ty,
-                )
-                | Rvalue::Cast(
-                    CastKind::PointerCoercion(PointerCoercion::ArrayToPointer),
-                    ref operand,
-                    to_ty,
                 ) => {
                     let to_layout = fx.layout_of(fx.monomorphize(to_ty));
                     let operand = codegen_operand(fx, operand);
                     lval.write_cvalue(fx, operand.cast_pointer_to(to_layout));
+                }
+                Rvalue::Cast(
+                    CastKind::PointerCoercion(
+                        PointerCoercion::MutToConstPointer | PointerCoercion::ArrayToPointer,
+                    ),
+                    ..,
+                ) => {
+                    bug!(
+                        "{:?} is for borrowck, and should never appear in codegen",
+                        to_place_and_rval.1
+                    );
                 }
                 Rvalue::Cast(
                     CastKind::IntToInt
@@ -826,9 +830,10 @@ fn codegen_stmt<'tcx>(
                     let val = match null_op {
                         NullOp::SizeOf => layout.size.bytes(),
                         NullOp::AlignOf => layout.align.abi.bytes(),
-                        NullOp::OffsetOf(fields) => {
-                            layout.offset_of_subfield(fx, fields.iter()).bytes()
-                        }
+                        NullOp::OffsetOf(fields) => fx
+                            .tcx
+                            .offset_of_subfield(ParamEnv::reveal_all(), layout, fields.iter())
+                            .bytes(),
                         NullOp::UbChecks => {
                             let val = fx.tcx.sess.ub_checks();
                             let val = CValue::by_val(
@@ -901,7 +906,7 @@ fn codegen_stmt<'tcx>(
         | StatementKind::PlaceMention(..)
         | StatementKind::AscribeUserType(..) => {}
 
-        StatementKind::Coverage { .. } => fx.tcx.dcx().fatal("-Zcoverage is unimplemented"),
+        StatementKind::Coverage { .. } => unreachable!(),
         StatementKind::Intrinsic(ref intrinsic) => match &**intrinsic {
             // We ignore `assume` intrinsics, they are only useful for optimizations
             NonDivergingIntrinsic::Assume(_) => {}

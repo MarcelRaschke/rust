@@ -4,6 +4,14 @@ hir_analysis_ambiguous_assoc_item = ambiguous associated {$assoc_kind} `{$assoc_
 hir_analysis_ambiguous_lifetime_bound =
     ambiguous lifetime bound, explicit lifetime bound required
 
+hir_analysis_assoc_item_constraints_not_allowed_here =
+    associated item constraints are not allowed here
+    .label = associated item constraint not allowed here
+
+hir_analysis_assoc_item_is_private = {$kind} `{$name}` is private
+    .label = private {$kind}
+    .defined_here_label = the {$kind} is defined here
+
 hir_analysis_assoc_item_not_found = associated {$assoc_kind} `{$assoc_name}` not found for `{$ty_param_name}`
 
 hir_analysis_assoc_item_not_found_found_in_other_trait_label = there is {$identically_named ->
@@ -23,10 +31,6 @@ hir_analysis_assoc_kind_mismatch = expected {$expected}, found {$got}
     .bound_on_assoc_const_label = bounds are not allowed on associated constants
 
 hir_analysis_assoc_kind_mismatch_wrap_in_braces_sugg = consider adding braces here
-
-hir_analysis_assoc_type_binding_not_allowed =
-    associated type bindings are not allowed here
-    .label = associated type not allowed here
 
 hir_analysis_associated_type_trait_uninferred_generic_params = cannot use the associated type of a trait with uninferred generic parameters
     .suggestion = use a fully qualified path with inferred lifetimes
@@ -116,6 +120,10 @@ hir_analysis_drop_impl_reservation = reservation `Drop` impls are not supported
 hir_analysis_duplicate_precise_capture = cannot capture parameter `{$name}` twice
     .label = parameter captured again here
 
+hir_analysis_effects_without_next_solver = using `#![feature(effects)]` without enabling next trait solver globally
+    .note = the next trait solver must be enabled globally for the effects feature to work correctly
+    .help = use `-Znext-solver` to enable
+
 hir_analysis_empty_specialization = specialization impl does not specialize any associated items
     .note = impl is a specialization of this impl
 
@@ -190,7 +198,7 @@ hir_analysis_inherent_ty_outside = cannot define inherent `impl` for a type outs
     .span_help = alternatively add `#[rustc_has_incoherent_inherent_impls]` to the type and `#[rustc_allow_incoherent_impl]` to the relevant impl items
 
 hir_analysis_inherent_ty_outside_new = cannot define inherent `impl` for a type outside of the crate where the type is defined
-    .label = impl for type defined outside of crate.
+    .label = impl for type defined outside of crate
     .note = define and implement a trait or new type instead
 
 hir_analysis_inherent_ty_outside_primitive = cannot define inherent `impl` for primitive types outside of `core`
@@ -371,9 +379,9 @@ hir_analysis_pass_to_variadic_function = can't pass `{$ty}` to variadic function
     .suggestion = cast the value to `{$cast_ty}`
     .help = cast the value to `{$cast_ty}`
 
-hir_analysis_pattern_type_non_const_range = "range patterns must have constant range start and end"
-hir_analysis_pattern_type_wild_pat = "wildcard patterns are not permitted for pattern types"
-    .label = "this type is the same as the inner type without a pattern"
+hir_analysis_pattern_type_non_const_range = range patterns must have constant range start and end
+hir_analysis_pattern_type_wild_pat = wildcard patterns are not permitted for pattern types
+    .label = this type is the same as the inner type without a pattern
 hir_analysis_placeholder_not_allowed_item_signatures = the placeholder `_` is not allowed within types on item signatures for {$kind}
     .label = not allowed in type signatures
 
@@ -460,6 +468,10 @@ hir_analysis_static_specialize = cannot specialize on `'static` lifetime
 hir_analysis_tait_forward_compat = item constrains opaque type that is not in its signature
     .note = this item must mention the opaque type in its signature in order to be able to register hidden types
 
+hir_analysis_tait_forward_compat2 = item does not constrain `{$opaque_type}`, but has it in its signature
+    .note = consider moving the opaque type's declaration and defining uses into a separate module
+    .opaque = this opaque type is in the signature
+
 hir_analysis_target_feature_on_main = `main` function is not allowed to have `#[target_feature]`
 
 hir_analysis_too_large_static = extern static is too large for the current architecture
@@ -502,7 +514,7 @@ hir_analysis_ty_param_some = type parameter `{$param}` must be used as the type 
     .note = implementing a foreign trait is only possible if at least one of the types for which it is implemented is local
     .only_note = only traits defined in the current crate can be implemented for a type parameter
 
-hir_analysis_type_of = {$type_of}
+hir_analysis_type_of = {$ty}
 
 hir_analysis_typeof_reserved_keyword_used =
     `typeof` is a reserved keyword but unimplemented
@@ -536,7 +548,7 @@ hir_analysis_unrecognized_intrinsic_function =
 
 hir_analysis_unused_associated_type_bounds =
     unnecessary associated type bound for not object safe associated type
-    .note = this associated type has a `where Self: Sized` bound. Thus, while the associated type can be specified, it cannot be used in any way, because trait objects are not `Sized`.
+    .note = this associated type has a `where Self: Sized` bound, and while the associated type can be specified, it cannot be used because trait objects are never `Sized`
     .suggestion = remove this bound
 
 hir_analysis_unused_generic_parameter =
@@ -558,7 +570,7 @@ hir_analysis_value_of_associated_struct_already_specified =
 hir_analysis_variadic_function_compatible_convention = C-variadic function must have a compatible calling convention, like {$conventions}
     .label = C-variadic function must have a compatible calling convention
 
-hir_analysis_variances_of = {$variances_of}
+hir_analysis_variances_of = {$variances}
 
 hir_analysis_where_clause_on_main = `main` function is not allowed to have a `where` clause
     .label = `main` cannot have a `where` clause

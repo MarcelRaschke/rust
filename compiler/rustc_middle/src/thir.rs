@@ -32,6 +32,7 @@ use rustc_target::asm::InlineAsmRegOrRegClass;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Index;
+use tracing::instrument;
 
 pub mod visit;
 
@@ -1032,8 +1033,8 @@ impl<'tcx> PatRangeBoundary<'tcx> {
                 if let (Some(a), Some(b)) = (a.try_to_scalar_int(), b.try_to_scalar_int()) {
                     let sz = ty.primitive_size(tcx);
                     let cmp = match ty.kind() {
-                        ty::Uint(_) | ty::Char => a.assert_uint(sz).cmp(&b.assert_uint(sz)),
-                        ty::Int(_) => a.assert_int(sz).cmp(&b.assert_int(sz)),
+                        ty::Uint(_) | ty::Char => a.to_uint(sz).cmp(&b.to_uint(sz)),
+                        ty::Int(_) => a.to_int(sz).cmp(&b.to_int(sz)),
                         _ => unreachable!(),
                     };
                     return Some(cmp);
@@ -1046,6 +1047,12 @@ impl<'tcx> PatRangeBoundary<'tcx> {
         let b = other.eval_bits(ty, tcx, param_env);
 
         match ty.kind() {
+            ty::Float(ty::FloatTy::F16) => {
+                use rustc_apfloat::Float;
+                let a = rustc_apfloat::ieee::Half::from_bits(a);
+                let b = rustc_apfloat::ieee::Half::from_bits(b);
+                a.partial_cmp(&b)
+            }
             ty::Float(ty::FloatTy::F32) => {
                 use rustc_apfloat::Float;
                 let a = rustc_apfloat::ieee::Single::from_bits(a);
@@ -1056,6 +1063,12 @@ impl<'tcx> PatRangeBoundary<'tcx> {
                 use rustc_apfloat::Float;
                 let a = rustc_apfloat::ieee::Double::from_bits(a);
                 let b = rustc_apfloat::ieee::Double::from_bits(b);
+                a.partial_cmp(&b)
+            }
+            ty::Float(ty::FloatTy::F128) => {
+                use rustc_apfloat::Float;
+                let a = rustc_apfloat::ieee::Quad::from_bits(a);
+                let b = rustc_apfloat::ieee::Quad::from_bits(b);
                 a.partial_cmp(&b)
             }
             ty::Int(ity) => {

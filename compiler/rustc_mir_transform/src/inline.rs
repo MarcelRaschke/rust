@@ -1,7 +1,7 @@
-//! Inlining pass for MIR functions
+//! Inlining pass for MIR functions.
+
 use crate::deref_separator::deref_finder;
 use rustc_attr::InlineAttr;
-use rustc_const_eval::transform::validate::validate_types;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::BitSet;
@@ -11,7 +11,7 @@ use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs}
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TypeVisitableExt;
-use rustc_middle::ty::{self, Instance, InstanceDef, ParamEnv, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, InstanceKind, ParamEnv, Ty, TyCtxt, TypeFlags};
 use rustc_session::config::{DebugInfo, OptLevel};
 use rustc_span::source_map::Spanned;
 use rustc_span::sym;
@@ -21,6 +21,7 @@ use rustc_target::spec::abi::Abi;
 use crate::cost_checker::CostChecker;
 use crate::simplify::simplify_cfg;
 use crate::util;
+use crate::validate::validate_types;
 use std::iter;
 use std::ops::{Range, RangeFrom};
 
@@ -84,13 +85,18 @@ fn inline<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
     }
 
     let param_env = tcx.param_env_reveal_all_normalized(def_id);
+    let codegen_fn_attrs = tcx.codegen_fn_attrs(def_id);
 
     let mut this = Inliner {
         tcx,
         param_env,
-        codegen_fn_attrs: tcx.codegen_fn_attrs(def_id),
+        codegen_fn_attrs,
         history: Vec::new(),
         changed: false,
+        caller_is_inline_forwarder: matches!(
+            codegen_fn_attrs.inline,
+            InlineAttr::Hint | InlineAttr::Always
+        ) && body_is_forwarder(body),
     };
     let blocks = START_BLOCK..body.basic_blocks.next_index();
     this.process_blocks(body, blocks);
@@ -110,6 +116,9 @@ struct Inliner<'tcx> {
     history: Vec<DefId>,
     /// Indicates that the caller body has been modified.
     changed: bool,
+    /// Indicates that the caller is #[inline] and just calls another function,
+    /// and thus we can inline less into it as it'll be inlined itself.
+    caller_is_inline_forwarder: bool,
 }
 
 impl<'tcx> Inliner<'tcx> {
@@ -225,13 +234,8 @@ impl<'tcx> Inliner<'tcx> {
         // Normally, this shouldn't be required, but trait normalization failure can create a
         // validation ICE.
         let output_type = callee_body.return_ty();
-        if !util::relate_types(
-            self.tcx,
-            self.param_env,
-            ty::Variance::Covariant,
-            output_type,
-            destination_ty,
-        ) {
+        if !util::relate_types(self.tcx, self.param_env, ty::Covariant, output_type, destination_ty)
+        {
             trace!(?output_type, ?destination_ty);
             return Err("failed to normalize return type");
         }
@@ -261,13 +265,8 @@ impl<'tcx> Inliner<'tcx> {
                 self_arg_ty.into_iter().chain(arg_tuple_tys).zip(callee_body.args_iter())
             {
                 let input_type = callee_body.local_decls[input].ty;
-                if !util::relate_types(
-                    self.tcx,
-                    self.param_env,
-                    ty::Variance::Covariant,
-                    input_type,
-                    arg_ty,
-                ) {
+                if !util::relate_types(self.tcx, self.param_env, ty::Covariant, input_type, arg_ty)
+                {
                     trace!(?arg_ty, ?input_type);
                     return Err("failed to normalize tuple argument type");
                 }
@@ -276,13 +275,8 @@ impl<'tcx> Inliner<'tcx> {
             for (arg, input) in args.iter().zip(callee_body.args_iter()) {
                 let input_type = callee_body.local_decls[input].ty;
                 let arg_ty = arg.node.ty(&caller_body.local_decls, self.tcx);
-                if !util::relate_types(
-                    self.tcx,
-                    self.param_env,
-                    ty::Variance::Covariant,
-                    input_type,
-                    arg_ty,
-                ) {
+                if !util::relate_types(self.tcx, self.param_env, ty::Covariant, input_type, arg_ty)
+                {
                     trace!(?arg_ty, ?input_type);
                     return Err("failed to normalize argument type");
                 }
@@ -308,7 +302,7 @@ impl<'tcx> Inliner<'tcx> {
         }
 
         match callee.def {
-            InstanceDef::Item(_) => {
+            InstanceKind::Item(_) => {
                 // If there is no MIR available (either because it was not in metadata or
                 // because it has no MIR because it's an extern function), then the inliner
                 // won't cause cycles on this.
@@ -317,24 +311,34 @@ impl<'tcx> Inliner<'tcx> {
                 }
             }
             // These have no own callable MIR.
-            InstanceDef::Intrinsic(_) | InstanceDef::Virtual(..) => {
+            InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => {
                 return Err("instance without MIR (intrinsic / virtual)");
             }
+
+            // FIXME(#127030): `ConstParamHasTy` has bad interactions with
+            // the drop shim builder, which does not evaluate predicates in
+            // the correct param-env for types being dropped. Stall resolving
+            // the MIR for this instance until all of its const params are
+            // substituted.
+            InstanceKind::DropGlue(_, Some(ty)) if ty.has_type_flags(TypeFlags::HAS_CT_PARAM) => {
+                return Err("still needs substitution");
+            }
+
             // This cannot result in an immediate cycle since the callee MIR is a shim, which does
             // not get any optimizations run on it. Any subsequent inlining may cause cycles, but we
             // do not need to catch this here, we can wait until the inliner decides to continue
             // inlining a second time.
-            InstanceDef::VTableShim(_)
-            | InstanceDef::ReifyShim(..)
-            | InstanceDef::FnPtrShim(..)
-            | InstanceDef::ClosureOnceShim { .. }
-            | InstanceDef::ConstructCoroutineInClosureShim { .. }
-            | InstanceDef::CoroutineKindShim { .. }
-            | InstanceDef::DropGlue(..)
-            | InstanceDef::CloneShim(..)
-            | InstanceDef::ThreadLocalShim(..)
-            | InstanceDef::FnPtrAddrShim(..)
-            | InstanceDef::AsyncDropGlueCtorShim(..) => return Ok(()),
+            InstanceKind::VTableShim(_)
+            | InstanceKind::ReifyShim(..)
+            | InstanceKind::FnPtrShim(..)
+            | InstanceKind::ClosureOnceShim { .. }
+            | InstanceKind::ConstructCoroutineInClosureShim { .. }
+            | InstanceKind::CoroutineKindShim { .. }
+            | InstanceKind::DropGlue(..)
+            | InstanceKind::CloneShim(..)
+            | InstanceKind::ThreadLocalShim(..)
+            | InstanceKind::FnPtrAddrShim(..)
+            | InstanceKind::AsyncDropGlueCtorShim(..) => return Ok(()),
         }
 
         if self.tcx.is_constructor(callee_def_id) {
@@ -387,7 +391,7 @@ impl<'tcx> Inliner<'tcx> {
                 let callee =
                     Instance::resolve(self.tcx, self.param_env, def_id, args).ok().flatten()?;
 
-                if let InstanceDef::Virtual(..) | InstanceDef::Intrinsic(_) = callee.def {
+                if let InstanceKind::Virtual(..) | InstanceKind::Intrinsic(_) = callee.def {
                     return None;
                 }
 
@@ -399,7 +403,7 @@ impl<'tcx> Inliner<'tcx> {
 
                 // Additionally, check that the body that we're inlining actually agrees
                 // with the ABI of the trait that the item comes from.
-                if let InstanceDef::Item(instance_def_id) = callee.def
+                if let InstanceKind::Item(instance_def_id) = callee.def
                     && self.tcx.def_kind(instance_def_id) == DefKind::AssocFn
                     && let instance_fn_sig = self.tcx.fn_sig(instance_def_id).skip_binder()
                     && instance_fn_sig.abi() != fn_sig.abi()
@@ -489,7 +493,9 @@ impl<'tcx> Inliner<'tcx> {
     ) -> Result<(), &'static str> {
         let tcx = self.tcx;
 
-        let mut threshold = if cross_crate_inlinable {
+        let mut threshold = if self.caller_is_inline_forwarder {
+            self.tcx.sess.opts.unstable_opts.inline_mir_forwarder_threshold.unwrap_or(30)
+        } else if cross_crate_inlinable {
             self.tcx.sess.opts.unstable_opts.inline_mir_hint_threshold.unwrap_or(100)
         } else {
             self.tcx.sess.opts.unstable_opts.inline_mir_threshold.unwrap_or(50)
@@ -507,6 +513,8 @@ impl<'tcx> Inliner<'tcx> {
 
         let mut checker =
             CostChecker::new(self.tcx, self.param_env, Some(callsite.callee), callee_body);
+
+        checker.add_function_level_costs();
 
         // Traverse the MIR manually so we can account for the effects of inlining on the CFG.
         let mut work_list = vec![START_BLOCK];
@@ -638,8 +646,7 @@ impl<'tcx> Inliner<'tcx> {
         };
 
         // Copy the arguments if needed.
-        let args: Vec<_> =
-            self.make_call_args(args, &callsite, caller_body, &callee_body, return_block);
+        let args = self.make_call_args(args, &callsite, caller_body, &callee_body, return_block);
 
         let mut integrator = Integrator {
             args: &args,
@@ -750,12 +757,12 @@ impl<'tcx> Inliner<'tcx> {
 
     fn make_call_args(
         &self,
-        args: Vec<Spanned<Operand<'tcx>>>,
+        args: Box<[Spanned<Operand<'tcx>>]>,
         callsite: &CallSite<'tcx>,
         caller_body: &mut Body<'tcx>,
         callee_body: &Body<'tcx>,
         return_block: Option<BasicBlock>,
-    ) -> Vec<Local> {
+    ) -> Box<[Local]> {
         let tcx = self.tcx;
 
         // There is a bit of a mismatch between the *caller* of a closure and the *callee*.
@@ -782,7 +789,8 @@ impl<'tcx> Inliner<'tcx> {
         //
         // and the vector is `[closure_ref, tmp0, tmp1, tmp2]`.
         if callsite.fn_sig.abi() == Abi::RustCall && callee_body.spread_arg.is_none() {
-            let mut args = args.into_iter();
+            // FIXME(edition_2024): switch back to a normal method call.
+            let mut args = <_>::into_iter(args);
             let self_ = self.create_temp_if_necessary(
                 args.next().unwrap().node,
                 callsite,
@@ -816,7 +824,8 @@ impl<'tcx> Inliner<'tcx> {
 
             closure_ref_arg.chain(tuple_tmp_args).collect()
         } else {
-            args.into_iter()
+            // FIXME(edition_2024): switch back to a normal method call.
+            <_>::into_iter(args)
                 .map(|a| self.create_temp_if_necessary(a.node, callsite, caller_body, return_block))
                 .collect()
         }
@@ -1078,10 +1087,10 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
 #[instrument(skip(tcx), level = "debug")]
 fn try_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: InstanceDef<'tcx>,
+    instance: InstanceKind<'tcx>,
 ) -> Result<&'tcx Body<'tcx>, &'static str> {
-    if let ty::InstanceDef::DropGlue(_, Some(ty))
-    | ty::InstanceDef::AsyncDropGlueCtorShim(_, Some(ty)) = instance
+    if let ty::InstanceKind::DropGlue(_, Some(ty))
+    | ty::InstanceKind::AsyncDropGlueCtorShim(_, Some(ty)) = instance
         && let ty::Adt(def, args) = ty.kind()
     {
         let fields = def.all_fields();
@@ -1093,4 +1102,38 @@ fn try_instance_mir<'tcx>(
         }
     }
     Ok(tcx.instance_mir(instance))
+}
+
+fn body_is_forwarder(body: &Body<'_>) -> bool {
+    let TerminatorKind::Call { target, .. } = body.basic_blocks[START_BLOCK].terminator().kind
+    else {
+        return false;
+    };
+    if let Some(target) = target {
+        let TerminatorKind::Return = body.basic_blocks[target].terminator().kind else {
+            return false;
+        };
+    }
+
+    let max_blocks = if !body.is_polymorphic {
+        2
+    } else if target.is_none() {
+        3
+    } else {
+        4
+    };
+    if body.basic_blocks.len() > max_blocks {
+        return false;
+    }
+
+    body.basic_blocks.iter_enumerated().all(|(bb, bb_data)| {
+        bb == START_BLOCK
+            || matches!(
+                bb_data.terminator().kind,
+                TerminatorKind::Return
+                    | TerminatorKind::Drop { .. }
+                    | TerminatorKind::UnwindResume
+                    | TerminatorKind::UnwindTerminate(_)
+            )
+    })
 }

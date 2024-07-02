@@ -4,13 +4,11 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Write};
-use std::fs::{self, File};
+use std::fs;
 use std::hash::Hash;
-use std::io::{BufRead, BufReader};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::core::build_steps::tool::{self, SourceType};
@@ -26,6 +24,7 @@ use crate::utils::helpers::{check_cfg_arg, libdir, linker_flags, output, t, LldT
 use crate::EXTRA_CHECK_CFGS;
 use crate::{Build, CLang, Crate, DocTests, GitRepo, Mode};
 
+use crate::utils::exec::BootstrapCommand;
 pub use crate::Compiler;
 
 use clap::ValueEnum;
@@ -274,7 +273,7 @@ impl PathSet {
     /// This is used for `StepDescription::krate`, which passes all matching crates at once to
     /// `Step::make_run`, rather than calling it many times with a single crate.
     /// See `tests.rs` for examples.
-    fn intersection_removing_matches(&self, needles: &mut Vec<&Path>, module: Kind) -> PathSet {
+    fn intersection_removing_matches(&self, needles: &mut Vec<PathBuf>, module: Kind) -> PathSet {
         let mut check = |p| {
             for (i, n) in needles.iter().enumerate() {
                 let matched = Self::check(p, n, module);
@@ -332,7 +331,6 @@ const PATH_REMAP: &[(&str, &[&str])] = &[
             "tests/mir-opt",
             "tests/pretty",
             "tests/run-make",
-            "tests/run-make-fulldeps",
             "tests/run-pass-valgrind",
             "tests/rustdoc",
             "tests/rustdoc-gui",
@@ -347,7 +345,7 @@ const PATH_REMAP: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn remap_paths(paths: &mut Vec<&Path>) {
+fn remap_paths(paths: &mut Vec<PathBuf>) {
     let mut remove = vec![];
     let mut add = vec![];
     for (i, path) in paths.iter().enumerate().filter_map(|(i, path)| path.to_str().map(|s| (i, s)))
@@ -356,7 +354,7 @@ fn remap_paths(paths: &mut Vec<&Path>) {
             // Remove leading and trailing slashes so `tests/` and `tests` are equivalent
             if path.trim_matches(std::path::is_separator) == search {
                 remove.push(i);
-                add.extend(replace.iter().map(Path::new));
+                add.extend(replace.iter().map(PathBuf::from));
                 break;
             }
         }
@@ -439,8 +437,25 @@ impl StepDescription {
             }
         }
 
-        // strip CurDir prefix if present
-        let mut paths: Vec<_> = paths.iter().map(|p| p.strip_prefix(".").unwrap_or(p)).collect();
+        // Attempt to resolve paths to be relative to the builder source directory.
+        let mut paths: Vec<PathBuf> = paths
+            .iter()
+            .map(|p| {
+                // If the path does not exist, it may represent the name of a Step, such as `tidy` in `x test tidy`
+                if !p.exists() {
+                    return p.clone();
+                }
+
+                // Make the path absolute, strip the prefix, and convert to a PathBuf.
+                match std::path::absolute(p) {
+                    Ok(p) => p.strip_prefix(&builder.src).unwrap_or(&p).to_path_buf(),
+                    Err(e) => {
+                        eprintln!("ERROR: {:?}", e);
+                        panic!("Due to the above error, failed to resolve path: {:?}", p);
+                    }
+                }
+            })
+            .collect();
 
         remap_paths(&mut paths);
 
@@ -578,7 +593,7 @@ impl<'a> ShouldRun<'a> {
     ///
     /// [`path`]: ShouldRun::path
     pub fn paths(mut self, paths: &[&str]) -> Self {
-        let submodules_paths = self.builder.get_all_submodules();
+        let submodules_paths = build_helper::util::parse_gitmodules(&self.builder.src);
 
         self.paths.insert(PathSet::Set(
             paths
@@ -630,7 +645,7 @@ impl<'a> ShouldRun<'a> {
     /// (for now, just `all_krates` and `paths`, but we may want to add an `aliases` function in the future?)
     fn pathset_for_paths_removing_matches(
         &self,
-        paths: &mut Vec<&Path>,
+        paths: &mut Vec<PathBuf>,
         kind: Kind,
     ) -> Vec<PathSet> {
         let mut sets = vec![];
@@ -667,6 +682,7 @@ pub enum Kind {
     Setup,
     Suggest,
     Vendor,
+    Perf,
 }
 
 impl Kind {
@@ -688,6 +704,7 @@ impl Kind {
             Kind::Setup => "setup",
             Kind::Suggest => "suggest",
             Kind::Vendor => "vendor",
+            Kind::Perf => "perf",
         }
     }
 
@@ -699,6 +716,7 @@ impl Kind {
             Kind::Run => "Running",
             Kind::Suggest => "Suggesting",
             Kind::Clippy => "Linting",
+            Kind::Perf => "Profiling & benchmarking",
             _ => {
                 let title_letter = self.as_str()[0..1].to_ascii_uppercase();
                 return format!("{title_letter}{}ing", &self.as_str()[1..]);
@@ -737,7 +755,6 @@ impl<'a> Builder<'a> {
                 tool::Rls,
                 tool::RustAnalyzer,
                 tool::RustAnalyzerProcMacroSrv,
-                tool::RustDemangler,
                 tool::Rustdoc,
                 tool::Clippy,
                 tool::CargoClippy,
@@ -751,7 +768,8 @@ impl<'a> Builder<'a> {
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
                 tool::CoverageDump,
-                tool::LlvmBitcodeLinker
+                tool::LlvmBitcodeLinker,
+                tool::RustcPerf,
             ),
             Kind::Clippy => describe!(
                 clippy::Std,
@@ -775,7 +793,6 @@ impl<'a> Builder<'a> {
                 clippy::RemoteTestServer,
                 clippy::Rls,
                 clippy::RustAnalyzer,
-                clippy::RustDemangler,
                 clippy::Rustdoc,
                 clippy::Rustfmt,
                 clippy::RustInstaller,
@@ -828,7 +845,6 @@ impl<'a> Builder<'a> {
                 test::RustAnalyzer,
                 test::ErrorIndex,
                 test::Distcheck,
-                test::RunMakeFullDeps,
                 test::Nomicon,
                 test::Reference,
                 test::RustdocBook,
@@ -844,7 +860,6 @@ impl<'a> Builder<'a> {
                 test::Miri,
                 test::CargoMiri,
                 test::Clippy,
-                test::RustDemangler,
                 test::CompiletestTest,
                 test::CrateRunMakeSupport,
                 test::RustdocJSStd,
@@ -888,6 +903,7 @@ impl<'a> Builder<'a> {
                 doc::Tidy,
                 doc::Bootstrap,
                 doc::Releases,
+                doc::RunMakeSupport,
             ),
             Kind::Dist => describe!(
                 dist::Docs,
@@ -904,7 +920,6 @@ impl<'a> Builder<'a> {
                 dist::Rls,
                 dist::RustAnalyzer,
                 dist::Rustfmt,
-                dist::RustDemangler,
                 dist::Clippy,
                 dist::Miri,
                 dist::LlvmTools,
@@ -931,7 +946,6 @@ impl<'a> Builder<'a> {
                 install::Cargo,
                 install::RustAnalyzer,
                 install::Rustfmt,
-                install::RustDemangler,
                 install::Clippy,
                 install::Miri,
                 install::LlvmTools,
@@ -951,7 +965,7 @@ impl<'a> Builder<'a> {
             Kind::Clean => describe!(clean::CleanAll, clean::Rustc, clean::Std),
             Kind::Vendor => describe!(vendor::Vendor),
             // special-cased in Build::build()
-            Kind::Format | Kind::Suggest => vec![],
+            Kind::Format | Kind::Suggest | Kind::Perf => vec![],
         }
     }
 
@@ -1023,6 +1037,7 @@ impl<'a> Builder<'a> {
                 path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
             ),
             Subcommand::Vendor { .. } => (Kind::Vendor, &paths[..]),
+            Subcommand::Perf { .. } => (Kind::Perf, &paths[..]),
         };
 
         Self::new_internal(build, kind, paths.to_owned())
@@ -1044,7 +1059,8 @@ impl<'a> Builder<'a> {
             // custom build of rustdoc maybe? link to the latest stable docs just in case
             _ => "stable",
         };
-        "https://doc.rust-lang.org/".to_owned() + channel
+
+        format!("https://doc.rust-lang.org/{channel}")
     }
 
     fn run_step_descriptions(&self, v: &[StepDescription], paths: &[PathBuf]) {
@@ -1202,7 +1218,7 @@ impl<'a> Builder<'a> {
 
     /// Adds the compiler's directory of dynamic libraries to `cmd`'s dynamic
     /// library lookup path.
-    pub fn add_rustc_lib_path(&self, compiler: Compiler, cmd: &mut Command) {
+    pub fn add_rustc_lib_path(&self, compiler: Compiler, cmd: &mut BootstrapCommand) {
         // Windows doesn't need dylib path munging because the dlls for the
         // compiler live next to the compiler and the system will find them
         // automatically.
@@ -1235,11 +1251,11 @@ impl<'a> Builder<'a> {
         self.ensure(tool::Rustdoc { compiler })
     }
 
-    pub fn cargo_clippy_cmd(&self, run_compiler: Compiler) -> Command {
+    pub fn cargo_clippy_cmd(&self, run_compiler: Compiler) -> BootstrapCommand {
         if run_compiler.stage == 0 {
             // `ensure(Clippy { stage: 0 })` *builds* clippy with stage0, it doesn't use the beta clippy.
             let cargo_clippy = self.build.config.download_clippy();
-            let mut cmd = Command::new(cargo_clippy);
+            let mut cmd = BootstrapCommand::new(cargo_clippy);
             cmd.env("CARGO", &self.initial_cargo);
             return cmd;
         }
@@ -1258,13 +1274,13 @@ impl<'a> Builder<'a> {
         let mut dylib_path = helpers::dylib_path();
         dylib_path.insert(0, self.sysroot(run_compiler).join("lib"));
 
-        let mut cmd = Command::new(cargo_clippy);
+        let mut cmd = BootstrapCommand::new(cargo_clippy);
         cmd.env(helpers::dylib_path_var(), env::join_paths(&dylib_path).unwrap());
         cmd.env("CARGO", &self.initial_cargo);
         cmd
     }
 
-    pub fn cargo_miri_cmd(&self, run_compiler: Compiler) -> Command {
+    pub fn cargo_miri_cmd(&self, run_compiler: Compiler) -> BootstrapCommand {
         assert!(run_compiler.stage > 0, "miri can not be invoked at stage 0");
         let build_compiler = self.compiler(run_compiler.stage - 1, self.build.build);
 
@@ -1280,7 +1296,7 @@ impl<'a> Builder<'a> {
             extra_features: Vec::new(),
         });
         // Invoke cargo-miri, make sure it can find miri and cargo.
-        let mut cmd = Command::new(cargo_miri);
+        let mut cmd = BootstrapCommand::new(cargo_miri);
         cmd.env("MIRI", &miri);
         cmd.env("CARGO", &self.initial_cargo);
         // Need to add the `run_compiler` libs. Those are the libs produces *by* `build_compiler`,
@@ -1295,8 +1311,8 @@ impl<'a> Builder<'a> {
         cmd
     }
 
-    pub fn rustdoc_cmd(&self, compiler: Compiler) -> Command {
-        let mut cmd = Command::new(self.bootstrap_out.join("rustdoc"));
+    pub fn rustdoc_cmd(&self, compiler: Compiler) -> BootstrapCommand {
+        let mut cmd = BootstrapCommand::new(self.bootstrap_out.join("rustdoc"));
         cmd.env("RUSTC_STAGE", compiler.stage.to_string())
             .env("RUSTC_SYSROOT", self.sysroot(compiler))
             // Note that this is *not* the sysroot_libdir because rustdoc must be linked
@@ -1337,7 +1353,7 @@ impl<'a> Builder<'a> {
         mode: Mode,
         target: TargetSelection,
         cmd: &str, // FIXME make this properly typed
-    ) -> Command {
+    ) -> BootstrapCommand {
         let mut cargo;
         if cmd == "clippy" {
             cargo = self.cargo_clippy_cmd(compiler);
@@ -1350,7 +1366,7 @@ impl<'a> Builder<'a> {
             cargo = self.cargo_miri_cmd(compiler);
             cargo.arg("miri").arg(subcmd);
         } else {
-            cargo = Command::new(&self.initial_cargo);
+            cargo = BootstrapCommand::new(&self.initial_cargo);
             cargo.arg(cmd);
         }
 
@@ -1555,7 +1571,6 @@ impl<'a> Builder<'a> {
         // features but cargo isn't involved in the #[path] process and so cannot pass the
         // complete list of features, so for that reason we don't enable checking of
         // features for std crates.
-        cargo.arg("-Zcheck-cfg");
         if mode == Mode::Std {
             rustflags.arg("--check-cfg=cfg(feature,values(any()))");
         }
@@ -2090,7 +2105,7 @@ impl<'a> Builder<'a> {
         // Try to use a sysroot-relative bindir, in case it was configured absolutely.
         cargo.env("RUSTC_INSTALL_BINDIR", self.config.bindir_relative());
 
-        self.ci_env.force_coloring_in_ci(&mut cargo);
+        self.ci_env.force_coloring_in_ci(&mut cargo.command);
 
         // When we build Rust dylibs they're all intended for intermediate
         // usage, so make sure we pass the -Cprefer-dynamic flag instead of
@@ -2227,28 +2242,6 @@ impl<'a> Builder<'a> {
         out
     }
 
-    /// Return paths of all submodules.
-    pub fn get_all_submodules(&self) -> &[String] {
-        static SUBMODULES_PATHS: OnceLock<Vec<String>> = OnceLock::new();
-
-        let init_submodules_paths = |src: &PathBuf| {
-            let file = File::open(src.join(".gitmodules")).unwrap();
-
-            let mut submodules_paths = vec![];
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                let line = line.trim();
-                if line.starts_with("path") {
-                    let actual_path = line.split(' ').last().expect("Couldn't get value of path");
-                    submodules_paths.push(actual_path.to_owned());
-                }
-            }
-
-            submodules_paths
-        };
-
-        SUBMODULES_PATHS.get_or_init(|| init_submodules_paths(&self.src))
-    }
-
     /// Ensure that a given step is built *only if it's supposed to be built by default*, returning
     /// its output. This will cache the step, so it's safe (and good!) to call this as often as
     /// needed to ensure that all dependencies are build.
@@ -2381,7 +2374,7 @@ impl HostFlags {
 
 #[derive(Debug)]
 pub struct Cargo {
-    command: Command,
+    command: BootstrapCommand,
     compiler: Compiler,
     target: TargetSelection,
     rustflags: Rustflags,
@@ -2606,8 +2599,8 @@ impl Cargo {
     }
 }
 
-impl From<Cargo> for Command {
-    fn from(mut cargo: Cargo) -> Command {
+impl From<Cargo> for BootstrapCommand {
+    fn from(mut cargo: Cargo) -> BootstrapCommand {
         let rustflags = &cargo.rustflags.0;
         if !rustflags.is_empty() {
             cargo.command.env("RUSTFLAGS", rustflags);
@@ -2626,7 +2619,12 @@ impl From<Cargo> for Command {
         if !cargo.allow_features.is_empty() {
             cargo.command.env("RUSTC_ALLOW_FEATURES", cargo.allow_features);
         }
-
         cargo.command
+    }
+}
+
+impl From<Cargo> for Command {
+    fn from(cargo: Cargo) -> Command {
+        BootstrapCommand::from(cargo).command
     }
 }

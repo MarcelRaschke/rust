@@ -34,7 +34,7 @@ pub use tt::{Delimiter, DelimiterKind, Punct};
 pub use crate::syntax_bridge::{
     parse_exprs_with_sep, parse_to_token_tree, parse_to_token_tree_static_span,
     syntax_node_to_token_tree, syntax_node_to_token_tree_modified, token_tree_to_syntax_node,
-    SpanMapper,
+    DocCommentDesugarMode, SpanMapper,
 };
 
 pub use crate::syntax_bridge::dummy_test_span_utils::*;
@@ -315,6 +315,12 @@ pub type ExpandResult<T> = ValueResult<T, ExpandError>;
 pub struct ValueResult<T, E> {
     pub value: T,
     pub err: Option<E>,
+}
+
+impl<T: Default, E> Default for ValueResult<T, E> {
+    fn default() -> Self {
+        Self { value: Default::default(), err: Default::default() }
+    }
 }
 
 impl<T, E> ValueResult<T, E> {

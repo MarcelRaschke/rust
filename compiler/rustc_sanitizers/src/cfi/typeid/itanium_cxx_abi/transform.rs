@@ -3,6 +3,7 @@
 //!
 //! For more information about LLVM CFI and cross-language LLVM CFI support for the Rust compiler,
 //! see design document in the tracking issue #89653.
+
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_middle::bug;
@@ -213,7 +214,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
         }
     }
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 }
@@ -231,7 +232,8 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
                 .filter(|item| item.kind == ty::AssocKind::Type)
                 .map(move |assoc_ty| {
                     super_poly_trait_ref.map_bound(|super_trait_ref| {
-                        let alias_ty = ty::AliasTy::new(tcx, assoc_ty.def_id, super_trait_ref.args);
+                        let alias_ty =
+                            ty::AliasTy::new_from_args(tcx, assoc_ty.def_id, super_trait_ref.args);
                         let resolved = tcx.normalize_erasing_regions(
                             ty::ParamEnv::reveal_all(),
                             alias_ty.to_ty(tcx),
@@ -269,7 +271,7 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
 /// if a function is member of the group derived from this type id. Therefore, in the first call to
 /// typeid_for_fnabi (when type ids are attached to functions and methods), it can only include at
 /// most as much information that would be available in the second call (i.e., during code
-/// generation at call sites); otherwise, the type ids would not not match.
+/// generation at call sites); otherwise, the type ids would not match.
 ///
 /// For this, it:
 ///
@@ -288,9 +290,10 @@ pub fn transform_instance<'tcx>(
     mut instance: Instance<'tcx>,
     options: TransformTyOptions,
 ) -> Instance<'tcx> {
-    if (matches!(instance.def, ty::InstanceDef::Virtual(..))
-        && Some(instance.def_id()) == tcx.lang_items().drop_in_place_fn())
-        || matches!(instance.def, ty::InstanceDef::DropGlue(..))
+    // FIXME: account for async-drop-glue
+    if (matches!(instance.def, ty::InstanceKind::Virtual(..))
+        && tcx.is_lang_item(instance.def_id(), LangItem::DropInPlace))
+        || matches!(instance.def, ty::InstanceKind::DropGlue(..))
     {
         // Adjust the type ids of DropGlues
         //
@@ -316,7 +319,7 @@ pub fn transform_instance<'tcx>(
         let predicates = tcx.mk_poly_existential_predicates(&[ty::Binder::dummy(predicate)]);
         let self_ty = Ty::new_dynamic(tcx, predicates, tcx.lifetimes.re_erased, ty::Dyn);
         instance.args = tcx.mk_args_trait(self_ty, List::empty());
-    } else if let ty::InstanceDef::Virtual(def_id, _) = instance.def {
+    } else if let ty::InstanceKind::Virtual(def_id, _) = instance.def {
         // Transform self into a trait object of the trait that defines the method for virtual
         // functions to match the type erasure done below.
         let upcast_ty = match tcx.trait_of_item(def_id) {
@@ -343,13 +346,13 @@ pub fn transform_instance<'tcx>(
             tcx.types.unit
         };
         instance.args = tcx.mk_args_trait(self_ty, instance.args.into_iter().skip(1));
-    } else if let ty::InstanceDef::VTableShim(def_id) = instance.def
+    } else if let ty::InstanceKind::VTableShim(def_id) = instance.def
         && let Some(trait_id) = tcx.trait_of_item(def_id)
     {
         // Adjust the type ids of VTableShims to the type id expected in the call sites for the
         // entry in the vtable (i.e., by using the signature of the closure passed as an argument
         // to the shim, or by just removing self).
-        let trait_ref = ty::TraitRef::new(tcx, trait_id, instance.args);
+        let trait_ref = ty::TraitRef::new_from_args(tcx, trait_id, instance.args);
         let invoke_ty = trait_object_ty(tcx, ty::Binder::dummy(trait_ref));
         instance.args = tcx.mk_args_trait(invoke_ty, trait_ref.args.into_iter().skip(1));
     }
@@ -367,7 +370,7 @@ pub fn transform_instance<'tcx>(
             let trait_method = tcx.associated_item(method_id);
             let trait_id = trait_ref.skip_binder().def_id;
             if traits::is_vtable_safe_method(tcx, trait_id, trait_method)
-                && tcx.object_safety_violations(trait_id).is_empty()
+                && tcx.is_object_safe(trait_id)
             {
                 // Trait methods will have a Self polymorphic parameter, where the concreteized
                 // implementatation will not. We need to walk back to the more general trait method
@@ -387,7 +390,7 @@ pub fn transform_instance<'tcx>(
                 // If we ever *do* start encoding the vtable index, we will need to generate an alias set
                 // based on which vtables we are putting this method into, as there will be more than one
                 // index value when supertraits are involved.
-                instance.def = ty::InstanceDef::Virtual(method_id, 0);
+                instance.def = ty::InstanceKind::Virtual(method_id, 0);
                 let abstract_trait_args =
                     tcx.mk_args_trait(invoke_ty, trait_ref.args.into_iter().skip(1));
                 instance.args = instance.args.rebase_onto(tcx, impl_id, abstract_trait_args);
@@ -430,7 +433,7 @@ pub fn transform_instance<'tcx>(
                 x => bug!("Unexpected type kind for closure-like: {x:?}"),
             };
             let concrete_args = tcx.mk_args_trait(closure_ty, inputs.map(Into::into));
-            let trait_ref = ty::TraitRef::new(tcx, trait_id, concrete_args);
+            let trait_ref = ty::TraitRef::new_from_args(tcx, trait_id, concrete_args);
             let invoke_ty = trait_object_ty(tcx, ty::Binder::dummy(trait_ref));
             let abstract_args = tcx.mk_args_trait(invoke_ty, trait_ref.args.into_iter().skip(1));
             // There should be exactly one method on this trait, and it should be the one we're
@@ -442,7 +445,7 @@ pub fn transform_instance<'tcx>(
                 .expect("No call-family function on closure-like Fn trait?")
                 .def_id;
 
-            instance.def = ty::InstanceDef::Virtual(call, 0);
+            instance.def = ty::InstanceKind::Virtual(call, 0);
             instance.args = abstract_args;
         }
     }

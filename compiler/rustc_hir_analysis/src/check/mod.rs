@@ -112,6 +112,7 @@ pub fn provide(providers: &mut Providers) {
     wfcheck::provide(providers);
     *providers = Providers {
         adt_destructor,
+        adt_async_destructor,
         region_scope_tree,
         collect_return_position_impl_trait_in_trait_tys,
         compare_impl_const: compare_impl_item::compare_impl_const_raw,
@@ -122,6 +123,10 @@ pub fn provide(providers: &mut Providers) {
 
 fn adt_destructor(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::Destructor> {
     tcx.calculate_dtor(def_id.to_def_id(), dropck::check_drop_impl)
+}
+
+fn adt_async_destructor(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::AsyncDestructor> {
+    tcx.calculate_async_dtor(def_id.to_def_id(), dropck::check_drop_impl)
 }
 
 /// Given a `DefId` for an opaque type in return position, find its parent item's return
@@ -206,11 +211,18 @@ fn missing_items_err(
         .collect::<Vec<_>>()
         .join("`, `");
 
-    // `Span` before impl block closing brace.
-    let hi = full_impl_span.hi() - BytePos(1);
-    // Point at the place right before the closing brace of the relevant `impl` to suggest
-    // adding the associated item at the end of its body.
-    let sugg_sp = full_impl_span.with_lo(hi).with_hi(hi);
+    let sugg_sp = if let Ok(snippet) = tcx.sess.source_map().span_to_snippet(full_impl_span)
+        && snippet.ends_with("}")
+    {
+        // `Span` before impl block closing brace.
+        let hi = full_impl_span.hi() - BytePos(1);
+        // Point at the place right before the closing brace of the relevant `impl` to suggest
+        // adding the associated item at the end of its body.
+        full_impl_span.with_lo(hi).with_hi(hi)
+    } else {
+        full_impl_span.shrink_to_hi()
+    };
+
     // Obtain the level of indentation ending in `sugg_sp`.
     let padding =
         tcx.sess.source_map().indentation_before(sugg_sp).unwrap_or_else(|| String::new());
@@ -436,7 +448,9 @@ fn fn_sig_suggestion<'tcx>(
         output = if let ty::Alias(_, alias_ty) = *output.kind() {
             tcx.explicit_item_super_predicates(alias_ty.def_id)
                 .iter_instantiated_copied(tcx, alias_ty.args)
-                .find_map(|(bound, _)| bound.as_projection_clause()?.no_bound_vars()?.term.ty())
+                .find_map(|(bound, _)| {
+                    bound.as_projection_clause()?.no_bound_vars()?.term.as_type()
+                })
                 .unwrap_or_else(|| {
                     span_bug!(
                         ident.span,
@@ -594,7 +608,7 @@ pub fn check_function_signature<'tcx>(
     let param_env = ty::ParamEnv::empty();
 
     let infcx = &tcx.infer_ctxt().build();
-    let ocx = ObligationCtxt::new(infcx);
+    let ocx = ObligationCtxt::new_with_diagnostics(infcx);
 
     let actual_sig = tcx.fn_sig(fn_id).instantiate_identity();
 

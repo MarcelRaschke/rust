@@ -1,6 +1,7 @@
 //! See docs in build/expr/mod.rs
 
 use crate::build::expr::category::{Category, RvalueFunc};
+use crate::build::matches::DeclareLetBindings;
 use crate::build::{BlockAnd, BlockAndExtension, BlockFrame, Builder, NeedsTemporary};
 use rustc_ast::InlineAsmOptions;
 use rustc_data_structures::fx::FxHashMap;
@@ -12,6 +13,7 @@ use rustc_middle::thir::*;
 use rustc_middle::ty::CanonicalUserTypeAnnotation;
 use rustc_span::source_map::Spanned;
 use std::iter;
+use tracing::{debug, instrument};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Compile `expr`, storing the result into `destination`, which
@@ -85,7 +87,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                     cond,
                                     Some(condition_scope), // Temp scope
                                     source_info,
-                                    true, // Declare `let` bindings normally
+                                    DeclareLetBindings::Yes, // Declare `let` bindings normally
                                 ));
 
                                 // Lower the `then` arm into its block.
@@ -149,6 +151,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::LogicalOp { op, lhs, rhs } => {
                 let condition_scope = this.local_scope();
                 let source_info = this.source_info(expr.span);
+
+                this.visit_coverage_branch_operation(op, expr.span);
+
                 // We first evaluate the left-hand side of the predicate ...
                 let (then_block, else_block) =
                     this.in_if_then_scope(condition_scope, expr.span, |this| {
@@ -159,7 +164,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             source_info,
                             // This flag controls how inner `let` expressions are lowered,
                             // but either way there shouldn't be any of those in here.
-                            true,
+                            DeclareLetBindings::LetNotPermitted,
                         )
                     });
                 let (short_circuit, continuation, constant) = match op {
@@ -182,9 +187,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         const_: Const::from_bool(this.tcx, constant),
                     },
                 );
-                let rhs = unpack!(this.expr_into_dest(destination, continuation, rhs));
+                let mut rhs_block = unpack!(this.expr_into_dest(destination, continuation, rhs));
+                // Instrument the lowered RHS's value for condition coverage.
+                // (Does nothing if condition coverage is not enabled.)
+                this.visit_coverage_standalone_condition(rhs, destination, &mut rhs_block);
+
                 let target = this.cfg.start_new_block();
-                this.cfg.goto(rhs, source_info, target);
+                this.cfg.goto(rhs_block, source_info, target);
                 this.cfg.goto(short_circuit, source_info, target);
                 target.unit()
             }
@@ -230,7 +239,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             ExprKind::Call { ty: _, fun, ref args, from_hir_call, fn_span } => {
                 let fun = unpack!(block = this.as_local_operand(block, fun));
-                let args: Vec<_> = args
+                let args: Box<[_]> = args
                     .into_iter()
                     .copied()
                     .map(|arg| Spanned {
@@ -477,7 +486,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         operands,
                         options,
                         line_spans,
-                        targets,
+                        targets: targets.into_boxed_slice(),
                         unwind: if options.contains(InlineAsmOptions::MAY_UNWIND) {
                             UnwindAction::Continue
                         } else {

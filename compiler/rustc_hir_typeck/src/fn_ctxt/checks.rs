@@ -113,17 +113,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         sp: Span,
         expr: &'tcx hir::Expr<'tcx>,
-        method: Result<MethodCallee<'tcx>, ()>,
+        method: Result<MethodCallee<'tcx>, ErrorGuaranteed>,
         args_no_rcvr: &'tcx [hir::Expr<'tcx>],
         tuple_arguments: TupleArgumentsFlag,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let has_error = match method {
-            Ok(method) => method.args.references_error() || method.sig.references_error(),
-            Err(_) => true,
+            Ok(method) => method.args.error_reported().and(method.sig.error_reported()),
+            Err(guar) => Err(guar),
         };
-        if has_error {
-            let err_inputs = self.err_args(args_no_rcvr.len());
+        if let Err(guar) = has_error {
+            let err_inputs = self.err_args(args_no_rcvr.len(), guar);
 
             let err_inputs = match tuple_arguments {
                 DontTupleArguments => err_inputs,
@@ -140,7 +140,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 tuple_arguments,
                 method.ok().map(|method| method.def_id),
             );
-            return Ty::new_misc_error(self.tcx);
+            return Ty::new_error(self.tcx, guar);
         }
 
         let method = method.unwrap();
@@ -237,15 +237,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 _ => {
                     // Otherwise, there's a mismatch, so clear out what we're expecting, and set
                     // our input types to err_args so we don't blow up the error messages
-                    struct_span_code_err!(
-                        tcx.dcx(),
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
                         call_span,
                         E0059,
                         "cannot use call notation; the first type parameter \
                          for the function trait is neither a tuple nor unit"
                     )
                     .emit();
-                    (self.err_args(provided_args.len()), None)
+                    (self.err_args(provided_args.len(), guar), None)
                 }
             }
         } else {
@@ -453,7 +453,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .map(|vars| self.resolve_vars_if_possible(vars)),
             );
 
-            self.set_tainted_by_errors(self.report_arg_errors(
+            self.report_arg_errors(
                 compatibility_diagonal,
                 formal_and_expected_inputs,
                 provided_args,
@@ -462,7 +462,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 fn_def_id,
                 call_span,
                 call_expr,
-            ));
+            );
         }
     }
 
@@ -788,7 +788,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             format!("arguments to this {call_name} are incorrect"),
                         );
                     } else {
-                        err = tcx.dcx().struct_span_err(
+                        err = self.dcx().struct_span_err(
                             full_call_span,
                             format!(
                                 "{call_name} takes {}{} but {} {} supplied",
@@ -848,7 +848,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 span_bug!(error_span, "expected errors from argument matrix");
             } else {
                 let mut err =
-                    tcx.dcx().create_err(errors::ArgMismatchIndeterminate { span: error_span });
+                    self.dcx().create_err(errors::ArgMismatchIndeterminate { span: error_span });
                 suggest_confusable(&mut err);
                 return err.emit();
             }
@@ -953,14 +953,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let mut err = if formal_and_expected_inputs.len() == provided_args.len() {
             struct_span_code_err!(
-                tcx.dcx(),
+                self.dcx(),
                 full_call_span,
                 E0308,
                 "arguments to this {} are incorrect",
                 call_name,
             )
         } else {
-            tcx.dcx()
+            self.dcx()
                 .struct_span_err(
                     full_call_span,
                     format!(
@@ -1424,7 +1424,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected_ty: Ty<'tcx>,
         provided_ty: Ty<'tcx>,
         arg: &hir::Expr<'tcx>,
-        err: &mut Diag<'tcx>,
+        err: &mut Diag<'_>,
     ) {
         if let ty::RawPtr(_, hir::Mutability::Mut) = expected_ty.kind()
             && let ty::RawPtr(_, hir::Mutability::Not) = provided_ty.kind()
@@ -1435,7 +1435,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         {
             // The user provided `ptr::null()`, but the function expects
             // `ptr::null_mut()`.
-            err.subdiagnostic(self.dcx(), SuggestPtrNullMut { span: arg.span });
+            err.subdiagnostic(SuggestPtrNullMut { span: arg.span });
         }
     }
 
@@ -1578,7 +1578,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // type of the place it is referencing, and not some
             // supertype thereof.
             let init_ty = self.check_expr_with_needs(init, Needs::maybe_mut_place(m));
-            if let Some(mut diag) = self.demand_eqtype_diag(init.span, local_ty, init_ty) {
+            if let Err(mut diag) = self.demand_eqtype_diag(init.span, local_ty, init_ty) {
                 self.emit_type_mismatch_suggestions(
                     &mut diag,
                     init.peel_drop_temps(),
@@ -1624,7 +1624,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let previous_diverges = self.diverges.get();
             let else_ty = self.check_block_with_expected(blk, NoExpectation);
             let cause = self.cause(blk.span, ObligationCauseCode::LetElse);
-            if let Some(err) = self.demand_eqtype_with_origin(&cause, self.tcx.types.never, else_ty)
+            if let Err(err) = self.demand_eqtype_with_origin(&cause, self.tcx.types.never, else_ty)
             {
                 err.emit();
             }
@@ -1774,7 +1774,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // that highlight errors inline.
                     let mut sp = blk.span;
                     let mut fn_span = None;
-                    if let Some((decl, ident)) = self.get_parent_fn_decl(blk.hir_id) {
+                    if let Some((fn_def_id, decl, _)) = self.get_fn_decl(blk.hir_id) {
                         let ret_sp = decl.output.span();
                         if let Some(block_sp) = self.parent_item_span(blk.hir_id) {
                             // HACK: on some cases (`ui/liveness/liveness-issue-2163.rs`) the
@@ -1782,7 +1782,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             // the span we're aiming at correspond to a `fn` body.
                             if block_sp == blk.span {
                                 sp = ret_sp;
-                                fn_span = Some(ident.span);
+                                fn_span = self.tcx.def_ident_span(fn_def_id);
                             }
                         }
                     }
@@ -1895,15 +1895,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             _ => {}
         }
         None
-    }
-
-    /// Given a function block's `HirId`, returns its `FnDecl` if it exists, or `None` otherwise.
-    pub(crate) fn get_parent_fn_decl(
-        &self,
-        blk_id: HirId,
-    ) -> Option<(&'tcx hir::FnDecl<'tcx>, Ident)> {
-        let parent = self.tcx.hir_node_by_def_id(self.tcx.hir().get_parent_item(blk_id).def_id);
-        self.get_node_fn_decl(parent).map(|(_, fn_decl, ident, _)| (fn_decl, ident))
     }
 
     /// If `expr` is a `match` expression that has only one non-`!` arm, use that arm's tail
@@ -2051,7 +2042,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                     if block_num > 1 && found_semi {
                         err.span_suggestion_verbose(
-                            span.shrink_to_lo(),
+                            // use the span of the *whole* expr
+                            self.tcx.hir().span(binding_hir_id).shrink_to_lo(),
                             "you might have meant to return this to infer its type parameters",
                             "return ",
                             Applicability::MaybeIncorrect,
@@ -2249,7 +2241,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             for (idx, (generic_param, param)) in
                 params_with_generics.iter().enumerate().filter(|(idx, _)| {
                     check_for_matched_generics
-                        || expected_idx.map_or(true, |expected_idx| expected_idx == *idx)
+                        || expected_idx.is_none_or(|expected_idx| expected_idx == *idx)
                 })
             {
                 let Some(generic_param) = generic_param else {

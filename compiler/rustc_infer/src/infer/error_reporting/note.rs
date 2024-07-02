@@ -14,7 +14,7 @@ use rustc_span::symbol::kw;
 
 use super::ObligationCauseAsDiagArg;
 
-impl<'tcx> TypeErrCtxt<'_, 'tcx> {
+impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     pub(super) fn note_region_origin(&self, err: &mut Diag<'_>, origin: &SubregionOrigin<'tcx>) {
         match *origin {
             infer::Subtype(ref trace) => RegionOriginNote::WithRequirement {
@@ -75,10 +75,11 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
 
     pub(super) fn report_concrete_failure(
         &self,
+        generic_param_scope: LocalDefId,
         origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> Diag<'tcx> {
+    ) -> Diag<'a> {
         let mut err = match origin {
             infer::Subtype(box trace) => {
                 let terr = TypeError::RegionsDoesNotOutlive(sup, sub);
@@ -89,6 +90,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         note_and_explain_region(
                             self.tcx,
                             &mut err,
+                            generic_param_scope,
                             "",
                             sup,
                             " doesn't meet the lifetime requirements",
@@ -99,6 +101,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         note_and_explain_region(
                             self.tcx,
                             &mut err,
+                            generic_param_scope,
                             "the required lifetime does not necessarily outlive ",
                             sub,
                             "",
@@ -106,10 +109,19 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         );
                     }
                     _ => {
-                        note_and_explain_region(self.tcx, &mut err, "", sup, "...", None);
                         note_and_explain_region(
                             self.tcx,
                             &mut err,
+                            generic_param_scope,
+                            "",
+                            sup,
+                            "...",
+                            None,
+                        );
+                        note_and_explain_region(
+                            self.tcx,
+                            &mut err,
+                            generic_param_scope,
                             "...does not necessarily outlive ",
                             sub,
                             "",
@@ -122,6 +134,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             infer::Reborrow(span) => {
                 let reference_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sub,
                     None,
                     note_and_explain::PrefixKind::RefValidFor,
@@ -129,6 +142,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 );
                 let content_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sup,
                     None,
                     note_and_explain::PrefixKind::ContentValidFor,
@@ -142,6 +156,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             infer::RelateObjectBound(span) => {
                 let object_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sub,
                     None,
                     note_and_explain::PrefixKind::TypeObjValidFor,
@@ -149,6 +164,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 );
                 let pointer_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sup,
                     None,
                     note_and_explain::PrefixKind::SourcePointerValidFor,
@@ -170,7 +186,12 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::SuffixKind::Empty
                 };
                 let note = note_and_explain::RegionExplanation::new(
-                    self.tcx, sub, opt_span, prefix, suffix,
+                    self.tcx,
+                    generic_param_scope,
+                    sub,
+                    opt_span,
+                    prefix,
+                    suffix,
                 );
                 self.dcx().create_err(FulfillReqLifetime {
                     span,
@@ -181,6 +202,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             infer::RelateRegionParamBound(span) => {
                 let param_instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sup,
                     None,
                     note_and_explain::PrefixKind::LfParamInstantiatedWith,
@@ -188,6 +210,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 );
                 let param_must_outlive = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sub,
                     None,
                     note_and_explain::PrefixKind::LfParamMustOutlive,
@@ -201,6 +224,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             infer::ReferenceOutlivesReferent(ty, span) => {
                 let pointer_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sub,
                     None,
                     note_and_explain::PrefixKind::PointerValidFor,
@@ -208,6 +232,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 );
                 let data_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sup,
                     None,
                     note_and_explain::PrefixKind::DataValidFor,
@@ -220,7 +245,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 })
             }
             infer::CompareImplItemObligation { span, impl_item_def_id, trait_item_def_id } => {
-                let mut err = self.report_extra_impl_obligation(
+                let mut err = self.infcx.report_extra_impl_obligation(
                     span,
                     impl_item_def_id,
                     trait_item_def_id,
@@ -239,7 +264,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 err
             }
             infer::CheckAssociatedTypeBounds { impl_item_def_id, trait_item_def_id, parent } => {
-                let mut err = self.report_concrete_failure(*parent, sub, sup);
+                let mut err = self.report_concrete_failure(generic_param_scope, *parent, sub, sup);
 
                 // Don't mention the item name if it's an RPITIT, since that'll just confuse
                 // folks.
@@ -262,6 +287,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             infer::AscribeUserTypeProvePredicate(span) => {
                 let instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sup,
                     None,
                     note_and_explain::PrefixKind::LfInstantiatedWith,
@@ -269,6 +295,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 );
                 let must_outlive = note_and_explain::RegionExplanation::new(
                     self.tcx,
+                    generic_param_scope,
                     sub,
                     None,
                     note_and_explain::PrefixKind::LfMustOutlive,
@@ -342,15 +369,16 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 trait_predicates: trait_predicates.join(", "),
             }
         };
-        err.subdiagnostic(self.dcx(), suggestion);
+        err.subdiagnostic(suggestion);
     }
 
     pub(super) fn report_placeholder_failure(
         &self,
+        generic_param_scope: LocalDefId,
         placeholder_origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> Diag<'tcx> {
+    ) -> Diag<'a> {
         // I can't think how to do better than this right now. -nikomatsakis
         debug!(?placeholder_origin, ?sub, ?sup, "report_placeholder_failure");
         match placeholder_origin {
@@ -368,7 +396,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     && !span.is_dummy()
                 {
                     let span = *span;
-                    self.report_concrete_failure(placeholder_origin, sub, sup)
+                    self.report_concrete_failure(generic_param_scope, placeholder_origin, sub, sup)
                         .with_span_note(span, "the lifetime requirement is introduced here")
                 } else {
                     unreachable!(
@@ -380,7 +408,14 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 let terr = TypeError::RegionsPlaceholderMismatch;
                 return self.report_and_explain_type_error(trace, terr);
             }
-            _ => return self.report_concrete_failure(placeholder_origin, sub, sup),
+            _ => {
+                return self.report_concrete_failure(
+                    generic_param_scope,
+                    placeholder_origin,
+                    sub,
+                    sup,
+                );
+            }
         }
     }
 }

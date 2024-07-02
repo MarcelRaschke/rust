@@ -101,6 +101,16 @@ Whether to allow `r#""#` when `r""` can be used
 * [`unnecessary_raw_string_hashes`](https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_raw_string_hashes)
 
 
+## `allow-panic-in-tests`
+Whether `panic` should be allowed in test functions or `#[cfg(test)]`
+
+**Default Value:** `false`
+
+---
+**Affected lints:**
+* [`panic`](https://rust-lang.github.io/rust-clippy/master/index.html#panic)
+
+
 ## `allow-print-in-tests`
 Whether print macros (ex. `println!`) should be allowed in test functions or `#[cfg(test)]`
 
@@ -120,6 +130,28 @@ Whether to allow module inception if it's not public.
 ---
 **Affected lints:**
 * [`module_inception`](https://rust-lang.github.io/rust-clippy/master/index.html#module_inception)
+
+
+## `allow-renamed-params-for`
+List of trait paths to ignore when checking renamed function parameters.
+
+#### Example
+
+```toml
+allow-renamed-params-for = [ "std::convert::From" ]
+```
+
+#### Noteworthy
+
+- By default, the following traits are ignored: `From`, `TryFrom`, `FromStr`
+- `".."` can be used as part of the list to indicate that the configured values should be appended to the
+default configuration of Clippy. By default, any configuration will replace the default value.
+
+**Default Value:** `["core::convert::From", "core::convert::TryFrom", "core::str::FromStr"]`
+
+---
+**Affected lints:**
+* [`renamed_function_params`](https://rust-lang.github.io/rust-clippy/master/index.html#renamed_function_params)
 
 
 ## `allow-unwrap-in-tests`
@@ -422,7 +454,7 @@ default configuration of Clippy. By default, any configuration will replace the 
 * `doc-valid-idents = ["ClipPy"]` would replace the default list with `["ClipPy"]`.
 * `doc-valid-idents = ["ClipPy", ".."]` would append `ClipPy` to the default list.
 
-**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "ClojureScript", "CoffeeScript", "JavaScript", "PureScript", "TypeScript", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "OCaml", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "WebGL", "WebGL2", "WebGPU", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
+**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "DevOps", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "ClojureScript", "CoffeeScript", "JavaScript", "PureScript", "TypeScript", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "OCaml", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "WebGL", "WebGL2", "WebGPU", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
 
 ---
 **Affected lints:**
@@ -637,6 +669,8 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 
 ---
 **Affected lints:**
+* [`allow_attributes`](https://rust-lang.github.io/rust-clippy/master/index.html#allow_attributes)
+* [`allow_attributes_without_reason`](https://rust-lang.github.io/rust-clippy/master/index.html#allow_attributes_without_reason)
 * [`almost_complete_range`](https://rust-lang.github.io/rust-clippy/master/index.html#almost_complete_range)
 * [`approx_constant`](https://rust-lang.github.io/rust-clippy/master/index.html#approx_constant)
 * [`assigning_clones`](https://rust-lang.github.io/rust-clippy/master/index.html#assigning_clones)
@@ -661,6 +695,7 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_is_ascii_check`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_ascii_check)
 * [`manual_let_else`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_let_else)
 * [`manual_non_exhaustive`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_non_exhaustive)
+* [`manual_pattern_char_comparison`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_pattern_char_comparison)
 * [`manual_range_contains`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains)
 * [`manual_rem_euclid`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_rem_euclid)
 * [`manual_retain`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_retain)
@@ -898,5 +933,15 @@ Whether to allow certain wildcard imports (prelude, super in tests).
 ---
 **Affected lints:**
 * [`wildcard_imports`](https://rust-lang.github.io/rust-clippy/master/index.html#wildcard_imports)
+
+
+## `warn-unsafe-macro-metavars-in-private-macros`
+Whether to also emit warnings for unsafe blocks with metavariable expansions in **private** macros.
+
+**Default Value:** `false`
+
+---
+**Affected lints:**
+* [`macro_metavars_in_unsafe`](https://rust-lang.github.io/rust-clippy/master/index.html#macro_metavars_in_unsafe)
 
 

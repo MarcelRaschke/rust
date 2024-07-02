@@ -3,21 +3,13 @@ import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
-import { execute, log, memoizeAsync } from "./util";
-import { unwrapNullable } from "./nullable";
-import { unwrapUndefinable } from "./undefinable";
+import { execute, log, memoizeAsync, unwrapNullable, unwrapUndefinable } from "./util";
 
 interface CompilationArtifact {
     fileName: string;
-    workspace: string;
     name: string;
     kind: string;
     isTest: boolean;
-}
-
-export interface ExecutableInfo {
-    executable: string;
-    workspace: string;
 }
 
 export interface ArtifactSpec {
@@ -74,7 +66,6 @@ export class Cargo {
                             artifacts.push({
                                 fileName: message.executable,
                                 name: message.target.name,
-                                workspace: path.dirname(message.manifest_path),
                                 kind: message.target.kind[0],
                                 isTest: message.profile.test,
                             });
@@ -93,7 +84,7 @@ export class Cargo {
         return spec.filter?.(artifacts) ?? artifacts;
     }
 
-    async executableInfoFromArgs(args: readonly string[]): Promise<ExecutableInfo> {
+    async executableFromArgs(args: readonly string[]): Promise<string> {
         const artifacts = await this.getArtifacts(Cargo.artifactSpec(args));
 
         if (artifacts.length === 0) {
@@ -103,10 +94,7 @@ export class Cargo {
         }
 
         const artifact = unwrapUndefinable(artifacts[0]);
-        return {
-            executable: artifact.fileName,
-            workspace: artifact.workspace,
-        };
+        return artifact.fileName;
     }
 
     private async runCargo(
@@ -161,12 +149,13 @@ export async function getRustcId(dir: string): Promise<string> {
 }
 
 /** Mirrors `toolchain::cargo()` implementation */
+// FIXME: The server should provide this
 export function cargoPath(): Promise<string> {
     return getPathForExecutable("cargo");
 }
 
 /** Mirrors `toolchain::get_path_for_executable()` implementation */
-export const getPathForExecutable = memoizeAsync(
+const getPathForExecutable = memoizeAsync(
     // We apply caching to decrease file-system interactions
     async (executableName: "cargo" | "rustc" | "rustup"): Promise<string> => {
         {

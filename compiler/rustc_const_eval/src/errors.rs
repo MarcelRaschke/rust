@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
+use either::Either;
 use rustc_errors::{
-    codes::*, Diag, DiagArgValue, DiagCtxt, DiagMessage, Diagnostic, EmissionGuarantee, Level,
+    codes::*, Diag, DiagArgValue, DiagCtxtHandle, DiagMessage, Diagnostic, EmissionGuarantee, Level,
 };
 use rustc_hir::ConstContext;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
@@ -424,7 +425,7 @@ pub struct ValidationFailure {
     #[primary_span]
     pub span: Span,
     #[note(const_eval_validation_failure_note)]
-    pub ub_note: Option<()>,
+    pub ub_note: (),
     #[subdiagnostic]
     pub frames: Vec<FrameNote>,
     #[subdiagnostic]
@@ -452,7 +453,7 @@ pub trait ReportErrorExt {
     }
 }
 
-fn bad_pointer_message(msg: CheckInAllocMsg, dcx: &DiagCtxt) -> String {
+fn bad_pointer_message(msg: CheckInAllocMsg, dcx: DiagCtxtHandle<'_>) -> String {
     use crate::fluent_generated::*;
 
     let msg = match msg {
@@ -481,6 +482,8 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             DivisionOverflow => const_eval_division_overflow,
             RemainderOverflow => const_eval_remainder_overflow,
             PointerArithOverflow => const_eval_pointer_arithmetic_overflow,
+            ArithOverflow { .. } => const_eval_overflow_arith,
+            ShiftOverflow { .. } => const_eval_overflow_shift,
             InvalidMeta(InvalidMetaKind::SliceTooBig) => const_eval_invalid_meta_slice,
             InvalidMeta(InvalidMetaKind::TooBig) => const_eval_invalid_meta,
             UnterminatedCString(_) => const_eval_unterminated_c_string,
@@ -539,6 +542,19 @@ impl<'a> ReportErrorExt for UndefinedBehaviorInfo<'a> {
             | UninhabitedEnumVariantWritten(_)
             | UninhabitedEnumVariantRead(_) => {}
 
+            ArithOverflow { intrinsic } => {
+                diag.arg("intrinsic", intrinsic);
+            }
+            ShiftOverflow { intrinsic, shift_amount } => {
+                diag.arg("intrinsic", intrinsic);
+                diag.arg(
+                    "shift_amount",
+                    match shift_amount {
+                        Either::Left(v) => v.to_string(),
+                        Either::Right(v) => v.to_string(),
+                    },
+                );
+            }
             BoundsCheckFailed { len, index } => {
                 diag.arg("len", len);
                 diag.arg("index", index);
@@ -623,9 +639,6 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
             PtrToUninhabited { ptr_kind: PointerKind::Ref(_), .. } => {
                 const_eval_validation_ref_to_uninhabited
             }
-
-            PtrToStatic { ptr_kind: PointerKind::Box } => const_eval_validation_box_to_static,
-            PtrToStatic { ptr_kind: PointerKind::Ref(_) } => const_eval_validation_ref_to_static,
 
             PointerAsInt { .. } => const_eval_validation_pointer_as_int,
             PartialPointer => const_eval_validation_partial_pointer,
@@ -791,7 +804,6 @@ impl<'tcx> ReportErrorExt for ValidationErrorInfo<'tcx> {
                 );
             }
             NullPtr { .. }
-            | PtrToStatic { .. }
             | ConstRefToMutable
             | ConstRefToExtern
             | MutableRefToImmutable
@@ -813,6 +825,7 @@ impl ReportErrorExt for UnsupportedOpInfo {
         use crate::fluent_generated::*;
         match self {
             UnsupportedOpInfo::Unsupported(s) => s.clone().into(),
+            UnsupportedOpInfo::ExternTypeField => const_eval_extern_type_field,
             UnsupportedOpInfo::UnsizedLocal => const_eval_unsized_local,
             UnsupportedOpInfo::OverwritePartialPointer(_) => const_eval_partial_pointer_overwrite,
             UnsupportedOpInfo::ReadPartialPointer(_) => const_eval_partial_pointer_copy,
@@ -833,7 +846,10 @@ impl ReportErrorExt for UnsupportedOpInfo {
             // `ReadPointerAsInt(Some(info))` is never printed anyway, it only serves as an error to
             // be further processed by validity checking which then turns it into something nice to
             // print. So it's not worth the effort of having diagnostics that can print the `info`.
-            UnsizedLocal | Unsupported(_) | ReadPointerAsInt(_) => {}
+            UnsizedLocal
+            | UnsupportedOpInfo::ExternTypeField
+            | Unsupported(_)
+            | ReadPointerAsInt(_) => {}
             OverwritePartialPointer(ptr) | ReadPartialPointer(ptr) => {
                 diag.arg("ptr", ptr);
             }

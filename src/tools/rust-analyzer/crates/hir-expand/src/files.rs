@@ -1,6 +1,4 @@
 //! Things to wrap other things in file ids.
-use std::iter;
-
 use either::Either;
 use span::{
     AstIdNode, ErasedFileAstId, FileAstId, FileId, FileRange, HirFileId, HirFileIdRepr,
@@ -150,31 +148,16 @@ impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, N> {
     }
 }
 
+impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, &N> {
+    // unfortunately `syntax` collides with the impl above, because `&_` is fundamental
+    pub fn syntax_ref(&self) -> InFileWrapper<FileId, &SyntaxNode> {
+        self.with_value(self.value.syntax())
+    }
+}
+
 // region:specific impls
 
 impl InFile<&SyntaxNode> {
-    /// Skips the attributed item that caused the macro invocation we are climbing up
-    pub fn ancestors_with_macros_skip_attr_item(
-        self,
-        db: &dyn db::ExpandDatabase,
-    ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
-        let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
-            Some(parent) => Some(node.with_value(parent)),
-            None => {
-                let macro_file_id = node.file_id.macro_file()?;
-                let parent_node = macro_file_id.call_node(db);
-                if macro_file_id.is_attr_macro(db) {
-                    // macro call was an attributed item, skip it
-                    // FIXME: does this fail if this is a direct expansion of another macro?
-                    parent_node.map(|node| node.parent()).transpose()
-                } else {
-                    Some(parent_node)
-                }
-            }
-        };
-        iter::successors(succ(&self.cloned()), succ)
-    }
-
     /// Falls back to the macro call range if the node cannot be mapped up fully.
     ///
     /// For attributes and derives, this will point back to the attribute only.

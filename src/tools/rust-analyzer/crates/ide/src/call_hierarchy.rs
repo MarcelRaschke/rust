@@ -19,13 +19,6 @@ pub struct CallItem {
     pub ranges: Vec<TextRange>,
 }
 
-impl CallItem {
-    #[cfg(test)]
-    pub(crate) fn debug_render(&self) -> String {
-        format!("{} : {:?}", self.target.debug_render(), self.ranges)
-    }
-}
-
 pub(crate) fn call_hierarchy(
     db: &RootDatabase,
     position: FilePosition,
@@ -109,12 +102,12 @@ pub(crate) fn outgoing_calls(
                     let expr = call.expr()?;
                     let callable = sema.type_of_expr(&expr)?.original.as_callable(db)?;
                     match callable.kind() {
-                        hir::CallableKind::Function(it) => {
-                            let range = expr.syntax().text_range();
-                            it.try_to_nav(db).zip(Some(range))
-                        }
+                        hir::CallableKind::Function(it) => it.try_to_nav(db),
+                        hir::CallableKind::TupleEnumVariant(it) => it.try_to_nav(db),
+                        hir::CallableKind::TupleStruct(it) => it.try_to_nav(db),
                         _ => None,
                     }
+                    .zip(Some(expr.syntax().text_range()))
                 }
                 ast::CallableExpr::MethodCall(expr) => {
                     let range = expr.name_ref()?.syntax().text_range();
@@ -159,6 +152,10 @@ mod tests {
         expected_incoming: Expect,
         expected_outgoing: Expect,
     ) {
+        fn debug_render(item: crate::CallItem) -> String {
+            format!("{} : {:?}", item.target.debug_render(), item.ranges)
+        }
+
         let (analysis, pos) = fixture::position(ra_fixture);
 
         let mut navs = analysis.call_hierarchy(pos).unwrap().unwrap().info;
@@ -169,12 +166,10 @@ mod tests {
         let item_pos =
             FilePosition { file_id: nav.file_id, offset: nav.focus_or_full_range().start() };
         let incoming_calls = analysis.incoming_calls(item_pos).unwrap().unwrap();
-        expected_incoming
-            .assert_eq(&incoming_calls.into_iter().map(|call| call.debug_render()).join("\n"));
+        expected_incoming.assert_eq(&incoming_calls.into_iter().map(debug_render).join("\n"));
 
         let outgoing_calls = analysis.outgoing_calls(item_pos).unwrap().unwrap();
-        expected_outgoing
-            .assert_eq(&outgoing_calls.into_iter().map(|call| call.debug_render()).join("\n"));
+        expected_outgoing.assert_eq(&outgoing_calls.into_iter().map(debug_render).join("\n"));
     }
 
     #[test]

@@ -325,6 +325,11 @@ impl Wtf8Buf {
         self.bytes.shrink_to(min_capacity)
     }
 
+    #[inline]
+    pub fn leak<'a>(self) -> &'a mut Wtf8 {
+        unsafe { Wtf8::from_mut_bytes_unchecked(self.bytes.leak()) }
+    }
+
     /// Returns the number of bytes that this string buffer can hold without reallocating.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -469,10 +474,13 @@ impl Wtf8Buf {
         Wtf8Buf { bytes: bytes.into_vec(), is_known_utf8: false }
     }
 
-    /// Part of a hack to make PathBuf::push/pop more efficient.
+    /// Provides plumbing to core `Vec::extend_from_slice`.
+    /// More well behaving alternative to allowing outer types
+    /// full mutable access to the core `Vec`.
     #[inline]
-    pub(crate) fn as_mut_vec_for_path_buf(&mut self) -> &mut Vec<u8> {
-        &mut self.bytes
+    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
+        self.bytes.extend_from_slice(other);
+        self.is_known_utf8 = false;
     }
 }
 

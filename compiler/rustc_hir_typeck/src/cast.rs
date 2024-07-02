@@ -319,7 +319,7 @@ impl<'a, 'tcx> CastCheck<'tcx> {
                 } else {
                     errors::CannotCastToBoolHelp::Unsupported(self.span)
                 };
-                fcx.tcx.dcx().emit_err(errors::CannotCastToBool { span: self.span, expr_ty, help });
+                fcx.dcx().emit_err(errors::CannotCastToBool { span: self.span, expr_ty, help });
             }
             CastError::CastToChar => {
                 let mut err = type_error_struct!(
@@ -946,7 +946,7 @@ impl<'a, 'tcx> CastCheck<'tcx> {
 
     fn lossy_provenance_ptr2int_lint(&self, fcx: &FnCtxt<'a, 'tcx>, t_c: ty::cast::IntTy) {
         let expr_prec = self.expr.precedence().order();
-        let needs_parens = expr_prec < rustc_ast::util::parser::PREC_POSTFIX;
+        let needs_parens = expr_prec < rustc_ast::util::parser::PREC_UNAMBIGUOUS;
 
         let needs_cast = !matches!(t_c, ty::cast::IntTy::U(ty::UintTy::Usize));
         let cast_span = self.expr_span.shrink_to_hi().to(self.cast_span);
@@ -1005,25 +1005,19 @@ impl<'a, 'tcx> CastCheck<'tcx> {
             if let Some((deref_ty, _)) = derefed {
                 // Give a note about what the expr derefs to.
                 if deref_ty != self.expr_ty.peel_refs() {
-                    err.subdiagnostic(
-                        fcx.dcx(),
-                        errors::DerefImplsIsEmpty {
-                            span: self.expr_span,
-                            deref_ty: fcx.ty_to_string(deref_ty),
-                        },
-                    );
+                    err.subdiagnostic(errors::DerefImplsIsEmpty {
+                        span: self.expr_span,
+                        deref_ty: fcx.ty_to_string(deref_ty),
+                    });
                 }
 
                 // Create a multipart suggestion: add `!` and `.is_empty()` in
                 // place of the cast.
-                err.subdiagnostic(
-                    fcx.dcx(),
-                    errors::UseIsEmpty {
-                        lo: self.expr_span.shrink_to_lo(),
-                        hi: self.span.with_lo(self.expr_span.hi()),
-                        expr_ty: fcx.ty_to_string(self.expr_ty),
-                    },
-                );
+                err.subdiagnostic(errors::UseIsEmpty {
+                    lo: self.expr_span.shrink_to_lo(),
+                    hi: self.span.with_lo(self.expr_span.hi()),
+                    expr_ty: fcx.ty_to_string(self.expr_ty),
+                });
             }
         }
     }

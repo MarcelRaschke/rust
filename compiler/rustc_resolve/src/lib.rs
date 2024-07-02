@@ -32,7 +32,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{FreezeReadGuard, Lrc};
-use rustc_errors::{Applicability, Diag, ErrCode};
+use rustc_errors::{Applicability, Diag, ErrCode, ErrorGuaranteed};
 use rustc_expand::base::{DeriveResolution, SyntaxExtension, SyntaxExtensionKind};
 use rustc_feature::BUILTIN_ATTRIBUTES;
 use rustc_hir::def::Namespace::{self, *};
@@ -51,7 +51,7 @@ use rustc_middle::ty::{self, DelegationFnSig, Feed, MainDefinition, RegisteredTo
 use rustc_middle::ty::{ResolverGlobalCtxt, ResolverOutputs, TyCtxt, TyCtxtFeed};
 use rustc_query_system::ich::StableHashingContext;
 use rustc_session::lint::builtin::PRIVATE_MACRO_USE;
-use rustc_session::lint::LintBuffer;
+use rustc_session::lint::{BuiltinLintDiag, LintBuffer};
 use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind, SyntaxContext, Transparency};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
@@ -694,10 +694,12 @@ impl<'a> fmt::Debug for Module<'a> {
 }
 
 /// Records a possibly-private value, type, or module definition.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct NameBindingData<'a> {
     kind: NameBindingKind<'a>,
     ambiguity: Option<(NameBinding<'a>, AmbiguityKind)>,
+    /// Produce a warning instead of an error when reporting ambiguities inside this binding.
+    /// May apply to indirect ambiguities under imports, so `ambiguity.is_some()` is not required.
     warn_ambiguity: bool,
     expansion: LocalExpnId,
     span: Span,
@@ -718,7 +720,7 @@ impl<'a> ToNameBinding<'a> for NameBinding<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum NameBindingKind<'a> {
     Res(Res),
     Module(Module<'a>),
@@ -830,18 +832,18 @@ impl<'a> NameBindingData<'a> {
         }
     }
 
-    fn is_ambiguity(&self) -> bool {
+    fn is_ambiguity_recursive(&self) -> bool {
         self.ambiguity.is_some()
             || match self.kind {
-                NameBindingKind::Import { binding, .. } => binding.is_ambiguity(),
+                NameBindingKind::Import { binding, .. } => binding.is_ambiguity_recursive(),
                 _ => false,
             }
     }
 
-    fn is_warn_ambiguity(&self) -> bool {
+    fn warn_ambiguity_recursive(&self) -> bool {
         self.warn_ambiguity
             || match self.kind {
-                NameBindingKind::Import { binding, .. } => binding.is_warn_ambiguity(),
+                NameBindingKind::Import { binding, .. } => binding.warn_ambiguity_recursive(),
                 _ => false,
             }
     }
@@ -1048,6 +1050,7 @@ pub struct Resolver<'a, 'tcx> {
 
     /// Maps glob imports to the names of items actually imported.
     glob_map: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
+    glob_error: Option<ErrorGuaranteed>,
     visibilities_for_hashing: Vec<(LocalDefId, ty::Visibility)>,
     used_imports: FxHashSet<NodeId>,
     maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
@@ -1088,7 +1091,7 @@ pub struct Resolver<'a, 'tcx> {
     single_segment_macro_resolutions:
         Vec<(Ident, MacroKind, ParentScope<'a>, Option<NameBinding<'a>>)>,
     multi_segment_macro_resolutions:
-        Vec<(Vec<Segment>, Span, MacroKind, ParentScope<'a>, Option<Res>)>,
+        Vec<(Vec<Segment>, Span, MacroKind, ParentScope<'a>, Option<Res>, Namespace)>,
     builtin_attrs: Vec<(Ident, ParentScope<'a>)>,
     /// `derive(Copy)` marks items they are applied to so they are treated specially later.
     /// Derive macros cannot modify the item themselves and have to store the markers in the global
@@ -1162,6 +1165,15 @@ pub struct Resolver<'a, 'tcx> {
     doc_link_resolutions: FxHashMap<LocalDefId, DocLinkResMap>,
     doc_link_traits_in_scope: FxHashMap<LocalDefId, Vec<DefId>>,
     all_macro_rules: FxHashMap<Symbol, Res>,
+
+    /// Invocation ids of all glob delegations.
+    glob_delegation_invoc_ids: FxHashSet<LocalExpnId>,
+    /// Analogue of module `unexpanded_invocations` but in trait impls, excluding glob delegations.
+    /// Needed because glob delegations wait for all other neighboring macros to expand.
+    impl_unexpanded_invocations: FxHashMap<LocalDefId, FxHashSet<LocalExpnId>>,
+    /// Simplified analogue of module `resolutions` but in trait impls, excluding glob delegations.
+    /// Needed because glob delegations exclude explicitly defined names.
+    impl_binding_keys: FxHashMap<LocalDefId, FxHashSet<BindingKey>>,
 }
 
 /// Nothing really interesting here; it just provides memory for the rest of the crate.
@@ -1417,6 +1429,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             ast_transform_scopes: FxHashMap::default(),
 
             glob_map: Default::default(),
+            glob_error: None,
             visibilities_for_hashing: Default::default(),
             used_imports: FxHashSet::default(),
             maybe_unused_trait_imports: Default::default(),
@@ -1502,6 +1515,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             doc_link_traits_in_scope: Default::default(),
             all_macro_rules: Default::default(),
             delegation_fn_sigs: Default::default(),
+            glob_delegation_invoc_ids: Default::default(),
+            impl_unexpanded_invocations: Default::default(),
+            impl_binding_keys: Default::default(),
         };
 
         let root_parent_scope = ParentScope::module(graph_root, &resolver);
@@ -1860,8 +1876,12 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         }
         if let NameBindingKind::Import { import, binding } = used_binding.kind {
             if let ImportKind::MacroUse { warn_private: true } = import.kind {
-                let msg = format!("macro `{ident}` is private");
-                self.lint_buffer().buffer_lint(PRIVATE_MACRO_USE, import.root_id, ident.span, msg);
+                self.lint_buffer().buffer_lint(
+                    PRIVATE_MACRO_USE,
+                    import.root_id,
+                    ident.span,
+                    BuiltinLintDiag::MacroIsPrivate(ident),
+                );
             }
             // Avoid marking `extern crate` items that refer to a name from extern prelude,
             // but not introduce it, as used if they are accessed from lexical scope.

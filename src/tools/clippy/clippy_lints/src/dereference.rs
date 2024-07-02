@@ -2,9 +2,11 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::sugg::has_enclosing_paren;
 use clippy_utils::ty::{implements_trait, is_manually_drop, peel_mid_ty_refs};
-use clippy_utils::{expr_use_ctxt, get_parent_expr, is_lint_allowed, path_to_local, DefinedTy, ExprUseNode};
+use clippy_utils::{
+    expr_use_ctxt, get_parent_expr, is_block_like, is_lint_allowed, path_to_local, DefinedTy, ExprUseNode,
+};
 use core::mem;
-use rustc_ast::util::parser::{PREC_POSTFIX, PREC_PREFIX};
+use rustc_ast::util::parser::{PREC_PREFIX, PREC_UNAMBIGUOUS};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{walk_ty, Visitor};
@@ -258,18 +260,13 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
             (None, kind) => {
                 let expr_ty = typeck.expr_ty(expr);
                 let use_cx = expr_use_ctxt(cx, expr);
-                let adjusted_ty = match &use_cx {
-                    Some(use_cx) => match use_cx.adjustments {
-                        [.., a] => a.target,
-                        _ => expr_ty,
-                    },
-                    _ => typeck.expr_ty_adjusted(expr),
-                };
+                let adjusted_ty = use_cx.adjustments.last().map_or(expr_ty, |a| a.target);
 
-                match (use_cx, kind) {
-                    (Some(use_cx), RefOp::Deref) => {
+                match kind {
+                    RefOp::Deref if use_cx.same_ctxt => {
+                        let use_node = use_cx.use_node(cx);
                         let sub_ty = typeck.expr_ty(sub_expr);
-                        if let ExprUseNode::FieldAccess(name) = use_cx.node
+                        if let ExprUseNode::FieldAccess(name) = use_node
                             && !use_cx.moved_before_use
                             && !ty_contains_field(sub_ty, name.name)
                         {
@@ -286,9 +283,9 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                         } else if sub_ty.is_ref()
                             // Linting method receivers would require verifying that name lookup
                             // would resolve the same way. This is complicated by trait methods.
-                            && !use_cx.node.is_recv()
-                            && let Some(ty) = use_cx.node.defined_ty(cx)
-                            && TyCoercionStability::for_defined_ty(cx, ty, use_cx.node.is_return()).is_deref_stable()
+                            && !use_node.is_recv()
+                            && let Some(ty) = use_node.defined_ty(cx)
+                            && TyCoercionStability::for_defined_ty(cx, ty, use_node.is_return()).is_deref_stable()
                         {
                             self.state = Some((
                                 State::ExplicitDeref { mutability: None },
@@ -299,7 +296,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                             ));
                         }
                     },
-                    (_, RefOp::Method { mutbl, is_ufcs })
+                    RefOp::Method { mutbl, is_ufcs }
                         if !is_lint_allowed(cx, EXPLICIT_DEREF_METHODS, expr.hir_id)
                             // Allow explicit deref in method chains. e.g. `foo.deref().bar()`
                             && (is_ufcs || !in_postfix_position(cx, expr)) =>
@@ -317,7 +314,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                             },
                         ));
                     },
-                    (Some(use_cx), RefOp::AddrOf(mutability)) => {
+                    RefOp::AddrOf(mutability) if use_cx.same_ctxt => {
                         // Find the number of times the borrow is auto-derefed.
                         let mut iter = use_cx.adjustments.iter();
                         let mut deref_count = 0usize;
@@ -336,10 +333,11 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                             };
                         };
 
-                        let stability = use_cx.node.defined_ty(cx).map_or(TyCoercionStability::None, |ty| {
-                            TyCoercionStability::for_defined_ty(cx, ty, use_cx.node.is_return())
+                        let use_node = use_cx.use_node(cx);
+                        let stability = use_node.defined_ty(cx).map_or(TyCoercionStability::None, |ty| {
+                            TyCoercionStability::for_defined_ty(cx, ty, use_node.is_return())
                         });
-                        let can_auto_borrow = match use_cx.node {
+                        let can_auto_borrow = match use_node {
                             ExprUseNode::FieldAccess(_)
                                 if !use_cx.moved_before_use && matches!(sub_expr.kind, ExprKind::Field(..)) =>
                             {
@@ -351,7 +349,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                 // deref through `ManuallyDrop<_>` will not compile.
                                 !adjust_derefs_manually_drop(use_cx.adjustments, expr_ty)
                             },
-                            ExprUseNode::Callee | ExprUseNode::FieldAccess(_) => true,
+                            ExprUseNode::Callee | ExprUseNode::FieldAccess(_) if !use_cx.moved_before_use => true,
                             ExprUseNode::MethodArg(hir_id, _, 0) if !use_cx.moved_before_use => {
                                 // Check for calls to trait methods where the trait is implemented
                                 // on a reference.
@@ -361,9 +359,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                 //   priority.
                                 if let Some(fn_id) = typeck.type_dependent_def_id(hir_id)
                                     && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
-                                    && let arg_ty = cx
-                                        .tcx
-                                        .erase_regions(use_cx.adjustments.last().map_or(expr_ty, |a| a.target))
+                                    && let arg_ty = cx.tcx.erase_regions(adjusted_ty)
                                     && let ty::Ref(_, sub_ty, _) = *arg_ty.kind()
                                     && let args =
                                         typeck.node_args_opt(hir_id).map(|args| &args[1..]).unwrap_or_default()
@@ -441,7 +437,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                     count: deref_count - required_refs,
                                     msg,
                                     stability,
-                                    for_field_access: if let ExprUseNode::FieldAccess(name) = use_cx.node
+                                    for_field_access: if let ExprUseNode::FieldAccess(name) = use_node
                                         && !use_cx.moved_before_use
                                     {
                                         Some(name.name)
@@ -451,7 +447,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                 }),
                                 StateData {
                                     first_expr: expr,
-                                    adjusted_ty: use_cx.adjustments.last().map_or(expr_ty, |a| a.target),
+                                    adjusted_ty,
                                 },
                             ));
                         } else if stability.is_deref_stable()
@@ -463,12 +459,12 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                 State::Borrow { mutability },
                                 StateData {
                                     first_expr: expr,
-                                    adjusted_ty: use_cx.adjustments.last().map_or(expr_ty, |a| a.target),
+                                    adjusted_ty,
                                 },
                             ));
                         }
                     },
-                    (None, _) | (_, RefOp::Method { .. }) => (),
+                    _ => {},
                 }
             },
             (
@@ -641,7 +637,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
         }
     }
 
-    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'_>) {
+    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &Body<'_>) {
         if Some(body.id()) == self.current_body {
             for pat in self.ref_locals.drain(..).filter_map(|(_, x)| x) {
                 let replacements = pat.replacements;
@@ -1011,7 +1007,7 @@ fn report<'tcx>(
                     let (precedence, calls_field) = match cx.tcx.parent_hir_node(data.first_expr.hir_id) {
                         Node::Expr(e) => match e.kind {
                             ExprKind::Call(callee, _) if callee.hir_id != data.first_expr.hir_id => (0, false),
-                            ExprKind::Call(..) => (PREC_POSTFIX, matches!(expr.kind, ExprKind::Field(..))),
+                            ExprKind::Call(..) => (PREC_UNAMBIGUOUS, matches!(expr.kind, ExprKind::Field(..))),
                             _ => (e.precedence().order(), false),
                         },
                         _ => (0, false),
@@ -1038,14 +1034,8 @@ fn report<'tcx>(
             );
         },
         State::ExplicitDeref { mutability } => {
-            if matches!(
-                expr.kind,
-                ExprKind::Block(..)
-                    | ExprKind::ConstBlock(_)
-                    | ExprKind::If(..)
-                    | ExprKind::Loop(..)
-                    | ExprKind::Match(..)
-            ) && let ty::Ref(_, ty, _) = data.adjusted_ty.kind()
+            if is_block_like(expr)
+                && let ty::Ref(_, ty, _) = data.adjusted_ty.kind()
                 && ty.is_sized(cx.tcx, cx.param_env)
             {
                 // Rustc bug: auto deref doesn't work on block expression when targeting sized types.
@@ -1164,7 +1154,7 @@ impl<'tcx> Dereferencing<'tcx> {
                         },
                         Some(parent) if !parent.span.from_expansion() => {
                             // Double reference might be needed at this point.
-                            if parent.precedence().order() == PREC_POSTFIX {
+                            if parent.precedence().order() == PREC_UNAMBIGUOUS {
                                 // Parentheses would be needed here, don't lint.
                                 *outer_pat = None;
                             } else {

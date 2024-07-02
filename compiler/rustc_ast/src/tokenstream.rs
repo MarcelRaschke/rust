@@ -224,7 +224,7 @@ impl AttrTokenStream {
                                 // Inner attributes are only supported on extern blocks, functions,
                                 // impls, and modules. All of these have their inner attributes
                                 // placed at the beginning of the rightmost outermost braced group:
-                                // e.g. fn foo() { #![my_attr} }
+                                // e.g. fn foo() { #![my_attr] }
                                 //
                                 // Therefore, we can insert them back into the right location
                                 // without needing to do any extra position tracking.
@@ -661,11 +661,11 @@ impl TokenStream {
             if attr_style == AttrStyle::Inner {
                 vec![
                     TokenTree::token_joint(token::Pound, span),
-                    TokenTree::token_alone(token::Not, span),
+                    TokenTree::token_joint_hidden(token::Not, span),
                     body,
                 ]
             } else {
-                vec![TokenTree::token_alone(token::Pound, span), body]
+                vec![TokenTree::token_joint_hidden(token::Pound, span), body]
             }
         }
     }

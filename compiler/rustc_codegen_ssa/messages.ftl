@@ -27,8 +27,6 @@ codegen_ssa_create_temp_dir = couldn't create a temp dir: {$error}
 
 codegen_ssa_error_creating_remark_dir = failed to create remark directory: {$error}
 
-codegen_ssa_expected_coverage_symbol = expected `coverage(off)` or `coverage(on)`
-
 codegen_ssa_expected_used_symbol = expected `used`, `used(compiler)` or `used(linker)`
 
 codegen_ssa_extern_funcs_not_found = some `extern` functions couldn't be found; some native libraries may need to be installed or have their path specified
@@ -211,6 +209,8 @@ codegen_ssa_rlib_not_found = could not find rlib for: `{$crate_name}`
 codegen_ssa_rlib_only_rmeta_found = could not find rlib for: `{$crate_name}`, found rmeta (metadata) file
 
 codegen_ssa_select_cpp_build_tool_workload = in the Visual Studio installer, ensure the "C++ build tools" workload is selected
+
+codegen_ssa_self_contained_linker_missing = the self-contained linker was requested, but it wasn't found in the target's sysroot, or in rustc's sysroot
 
 codegen_ssa_shuffle_indices_evaluation = could not evaluate shuffle_indices at compile time
 

@@ -1,6 +1,6 @@
 //! Type tree for term search
 
-use hir_def::find_path::PrefixKind;
+use hir_def::ImportPathConfig;
 use hir_expand::mod_path::ModPath;
 use hir_ty::{
     db::HirDatabase,
@@ -9,50 +9,28 @@ use hir_ty::{
 use itertools::Itertools;
 
 use crate::{
-    Adt, AsAssocItem, Const, ConstParam, Field, Function, GenericDef, Local, ModuleDef,
-    SemanticsScope, Static, Struct, StructKind, Trait, Type, Variant,
+    Adt, AsAssocItem, AssocItemContainer, Const, ConstParam, Field, Function, GenericDef, Local,
+    ModuleDef, SemanticsScope, Static, Struct, StructKind, Trait, Type, Variant,
 };
 
 /// Helper function to get path to `ModuleDef`
 fn mod_item_path(
     sema_scope: &SemanticsScope<'_>,
     def: &ModuleDef,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Option<ModPath> {
     let db = sema_scope.db;
-    // Account for locals shadowing items from module
-    let name_hit_count = def.name(db).map(|def_name| {
-        let mut name_hit_count = 0;
-        sema_scope.process_all_names(&mut |name, _| {
-            if name == def_name {
-                name_hit_count += 1;
-            }
-        });
-        name_hit_count
-    });
-
     let m = sema_scope.module();
-    match name_hit_count {
-        Some(0..=1) | None => m.find_use_path(db.upcast(), *def, prefer_no_std, prefer_prelude),
-        Some(_) => m.find_use_path_prefixed(
-            db.upcast(),
-            *def,
-            PrefixKind::ByCrate,
-            prefer_no_std,
-            prefer_prelude,
-        ),
-    }
+    m.find_path(db.upcast(), *def, cfg)
 }
 
 /// Helper function to get path to `ModuleDef` as string
 fn mod_item_path_str(
     sema_scope: &SemanticsScope<'_>,
     def: &ModuleDef,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Result<String, DisplaySourceCodeError> {
-    let path = mod_item_path(sema_scope, def, prefer_no_std, prefer_prelude);
+    let path = mod_item_path(sema_scope, def, cfg);
     path.map(|it| it.display(sema_scope.db.upcast()).to_string())
         .ok_or(DisplaySourceCodeError::PathNotFound)
 }
@@ -61,8 +39,7 @@ fn mod_item_path_str(
 fn type_path(
     sema_scope: &SemanticsScope<'_>,
     ty: &Type,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Result<String, DisplaySourceCodeError> {
     let db = sema_scope.db;
     let m = sema_scope.module();
@@ -71,9 +48,7 @@ fn type_path(
         Some(adt) => {
             let ty_name = ty.display_source_code(db, m.id, true)?;
 
-            let mut path =
-                mod_item_path(sema_scope, &ModuleDef::Adt(adt), prefer_no_std, prefer_prelude)
-                    .unwrap();
+            let mut path = mod_item_path(sema_scope, &ModuleDef::Adt(adt), cfg).unwrap();
             path.pop_segment();
             let path = path.display(db.upcast()).to_string();
             let res = match path.is_empty() {
@@ -158,13 +133,22 @@ impl Expr {
         &self,
         sema_scope: &SemanticsScope<'_>,
         many_formatter: &mut dyn FnMut(&Type) -> String,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
+        cfg: ImportPathConfig,
     ) -> Result<String, DisplaySourceCodeError> {
         let db = sema_scope.db;
-        let mod_item_path_str = |s, def| mod_item_path_str(s, def, prefer_no_std, prefer_prelude);
+        let mod_item_path_str = |s, def| mod_item_path_str(s, def, cfg);
         match self {
-            Expr::Const(it) => mod_item_path_str(sema_scope, &ModuleDef::Const(*it)),
+            Expr::Const(it) => match it.as_assoc_item(db).map(|it| it.container(db)) {
+                Some(container) => {
+                    let container_name = container_name(container, sema_scope, cfg)?;
+                    let const_name = it
+                        .name(db)
+                        .map(|c| c.display(db.upcast()).to_string())
+                        .unwrap_or(String::new());
+                    Ok(format!("{container_name}::{const_name}"))
+                }
+                None => mod_item_path_str(sema_scope, &ModuleDef::Const(*it)),
+            },
             Expr::Static(it) => mod_item_path_str(sema_scope, &ModuleDef::Static(*it)),
             Expr::Local(it) => Ok(it.name(db).display(db.upcast()).to_string()),
             Expr::ConstParam(it) => Ok(it.name(db).display(db.upcast()).to_string()),
@@ -172,35 +156,14 @@ impl Expr {
             Expr::Function { func, params, .. } => {
                 let args = params
                     .iter()
-                    .map(|f| {
-                        f.gen_source_code(sema_scope, many_formatter, prefer_no_std, prefer_prelude)
-                    })
+                    .map(|f| f.gen_source_code(sema_scope, many_formatter, cfg))
                     .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                     .into_iter()
                     .join(", ");
 
                 match func.as_assoc_item(db).map(|it| it.container(db)) {
                     Some(container) => {
-                        let container_name = match container {
-                            crate::AssocItemContainer::Trait(trait_) => {
-                                mod_item_path_str(sema_scope, &ModuleDef::Trait(trait_))?
-                            }
-                            crate::AssocItemContainer::Impl(imp) => {
-                                let self_ty = imp.self_ty(db);
-                                // Should it be guaranteed that `mod_item_path` always exists?
-                                match self_ty.as_adt().and_then(|adt| {
-                                    mod_item_path(
-                                        sema_scope,
-                                        &adt.into(),
-                                        prefer_no_std,
-                                        prefer_prelude,
-                                    )
-                                }) {
-                                    Some(path) => path.display(sema_scope.db.upcast()).to_string(),
-                                    None => self_ty.display(db).to_string(),
-                                }
-                            }
-                        };
+                        let container_name = container_name(container, sema_scope, cfg)?;
                         let fn_name = func.name(db).display(db.upcast()).to_string();
                         Ok(format!("{container_name}::{fn_name}({args})"))
                     }
@@ -211,23 +174,16 @@ impl Expr {
                 }
             }
             Expr::Method { func, target, params, .. } => {
-                if target.contains_many_in_illegal_pos() {
+                if self.contains_many_in_illegal_pos(db) {
                     return Ok(many_formatter(&target.ty(db)));
                 }
 
                 let func_name = func.name(db).display(db.upcast()).to_string();
                 let self_param = func.self_param(db).unwrap();
-                let target = target.gen_source_code(
-                    sema_scope,
-                    many_formatter,
-                    prefer_no_std,
-                    prefer_prelude,
-                )?;
+                let target_str = target.gen_source_code(sema_scope, many_formatter, cfg)?;
                 let args = params
                     .iter()
-                    .map(|f| {
-                        f.gen_source_code(sema_scope, many_formatter, prefer_no_std, prefer_prelude)
-                    })
+                    .map(|f| f.gen_source_code(sema_scope, many_formatter, cfg))
                     .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                     .into_iter()
                     .join(", ");
@@ -236,9 +192,12 @@ impl Expr {
                     Some(trait_) => {
                         let trait_name = mod_item_path_str(sema_scope, &ModuleDef::Trait(trait_))?;
                         let target = match self_param.access(db) {
-                            crate::Access::Shared => format!("&{target}"),
-                            crate::Access::Exclusive => format!("&mut {target}"),
-                            crate::Access::Owned => target,
+                            crate::Access::Shared if !target.is_many() => format!("&{target_str}"),
+                            crate::Access::Exclusive if !target.is_many() => {
+                                format!("&mut {target_str}")
+                            }
+                            crate::Access::Owned => target_str,
+                            _ => many_formatter(&target.ty(db)),
                         };
                         let res = match args.is_empty() {
                             true => format!("{trait_name}::{func_name}({target})",),
@@ -246,7 +205,7 @@ impl Expr {
                         };
                         Ok(res)
                     }
-                    None => Ok(format!("{target}.{func_name}({args})")),
+                    None => Ok(format!("{target_str}.{func_name}({args})")),
                 }
             }
             Expr::Variant { variant, generics, params } => {
@@ -256,7 +215,7 @@ impl Expr {
                     false => {
                         let generics = generics
                             .iter()
-                            .map(|it| type_path(sema_scope, it, prefer_no_std, prefer_prelude))
+                            .map(|it| type_path(sema_scope, it, cfg))
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
@@ -267,14 +226,7 @@ impl Expr {
                     StructKind::Tuple => {
                         let args = params
                             .iter()
-                            .map(|f| {
-                                f.gen_source_code(
-                                    sema_scope,
-                                    many_formatter,
-                                    prefer_no_std,
-                                    prefer_prelude,
-                                )
-                            })
+                            .map(|f| f.gen_source_code(sema_scope, many_formatter, cfg))
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
@@ -289,12 +241,7 @@ impl Expr {
                                 let tmp = format!(
                                     "{}: {}",
                                     f.name(db).display(db.upcast()),
-                                    a.gen_source_code(
-                                        sema_scope,
-                                        many_formatter,
-                                        prefer_no_std,
-                                        prefer_prelude
-                                    )?
+                                    a.gen_source_code(sema_scope, many_formatter, cfg)?
                                 );
                                 Ok(tmp)
                             })
@@ -315,14 +262,7 @@ impl Expr {
                     StructKind::Tuple => {
                         let args = params
                             .iter()
-                            .map(|a| {
-                                a.gen_source_code(
-                                    sema_scope,
-                                    many_formatter,
-                                    prefer_no_std,
-                                    prefer_prelude,
-                                )
-                            })
+                            .map(|a| a.gen_source_code(sema_scope, many_formatter, cfg))
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
@@ -337,12 +277,7 @@ impl Expr {
                                 let tmp = format!(
                                     "{}: {}",
                                     f.name(db).display(db.upcast()),
-                                    a.gen_source_code(
-                                        sema_scope,
-                                        many_formatter,
-                                        prefer_no_std,
-                                        prefer_prelude
-                                    )?
+                                    a.gen_source_code(sema_scope, many_formatter, cfg)?
                                 );
                                 Ok(tmp)
                             })
@@ -356,7 +291,7 @@ impl Expr {
                         false => {
                             let generics = generics
                                 .iter()
-                                .map(|it| type_path(sema_scope, it, prefer_no_std, prefer_prelude))
+                                .map(|it| type_path(sema_scope, it, cfg))
                                 .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                                 .into_iter()
                                 .join(", ");
@@ -371,9 +306,7 @@ impl Expr {
             Expr::Tuple { params, .. } => {
                 let args = params
                     .iter()
-                    .map(|a| {
-                        a.gen_source_code(sema_scope, many_formatter, prefer_no_std, prefer_prelude)
-                    })
+                    .map(|a| a.gen_source_code(sema_scope, many_formatter, cfg))
                     .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                     .into_iter()
                     .join(", ");
@@ -381,30 +314,20 @@ impl Expr {
                 Ok(res)
             }
             Expr::Field { expr, field } => {
-                if expr.contains_many_in_illegal_pos() {
+                if expr.contains_many_in_illegal_pos(db) {
                     return Ok(many_formatter(&expr.ty(db)));
                 }
 
-                let strukt = expr.gen_source_code(
-                    sema_scope,
-                    many_formatter,
-                    prefer_no_std,
-                    prefer_prelude,
-                )?;
+                let strukt = expr.gen_source_code(sema_scope, many_formatter, cfg)?;
                 let field = field.name(db).display(db.upcast()).to_string();
                 Ok(format!("{strukt}.{field}"))
             }
             Expr::Reference(expr) => {
-                if expr.contains_many_in_illegal_pos() {
+                if expr.contains_many_in_illegal_pos(db) {
                     return Ok(many_formatter(&expr.ty(db)));
                 }
 
-                let inner = expr.gen_source_code(
-                    sema_scope,
-                    many_formatter,
-                    prefer_no_std,
-                    prefer_prelude,
-                )?;
+                let inner = expr.gen_source_code(sema_scope, many_formatter, cfg)?;
                 Ok(format!("&{inner}"))
             }
             Expr::Many(ty) => Ok(many_formatter(ty)),
@@ -466,10 +389,15 @@ impl Expr {
     /// macro!().bar()
     /// &macro!()
     /// ```
-    fn contains_many_in_illegal_pos(&self) -> bool {
+    fn contains_many_in_illegal_pos(&self, db: &dyn HirDatabase) -> bool {
         match self {
-            Expr::Method { target, .. } => target.contains_many_in_illegal_pos(),
-            Expr::Field { expr, .. } => expr.contains_many_in_illegal_pos(),
+            Expr::Method { target, func, .. } => {
+                match func.as_assoc_item(db).and_then(|it| it.container_or_implemented_trait(db)) {
+                    Some(_) => false,
+                    None => target.is_many(),
+                }
+            }
+            Expr::Field { expr, .. } => expr.contains_many_in_illegal_pos(db),
             Expr::Reference(target) => target.is_many(),
             Expr::Many(_) => true,
             _ => false,
@@ -480,4 +408,26 @@ impl Expr {
     pub fn is_many(&self) -> bool {
         matches!(self, Expr::Many(_))
     }
+}
+
+/// Helper function to find name of container
+fn container_name(
+    container: AssocItemContainer,
+    sema_scope: &SemanticsScope<'_>,
+    cfg: ImportPathConfig,
+) -> Result<String, DisplaySourceCodeError> {
+    let container_name = match container {
+        crate::AssocItemContainer::Trait(trait_) => {
+            mod_item_path_str(sema_scope, &ModuleDef::Trait(trait_), cfg)?
+        }
+        crate::AssocItemContainer::Impl(imp) => {
+            let self_ty = imp.self_ty(sema_scope.db);
+            // Should it be guaranteed that `mod_item_path` always exists?
+            match self_ty.as_adt().and_then(|adt| mod_item_path(sema_scope, &adt.into(), cfg)) {
+                Some(path) => path.display(sema_scope.db.upcast()).to_string(),
+                None => self_ty.display(sema_scope.db).to_string(),
+            }
+        }
+    };
+    Ok(container_name)
 }

@@ -1,4 +1,5 @@
-/// Functionality for statements, operands, places, and things that appear in them.
+//! Functionality for statements, operands, places, and things that appear in them.
+
 use super::{interpret::GlobalAlloc, *};
 
 ///////////////////////////////////////////////////////////////////////////
@@ -438,7 +439,6 @@ impl<'tcx> Rvalue<'tcx> {
                 _,
             )
             | Rvalue::BinaryOp(_, _)
-            | Rvalue::CheckedBinaryOp(_, _)
             | Rvalue::NullaryOp(_, _)
             | Rvalue::UnaryOp(_, _)
             | Rvalue::Discriminant(_)

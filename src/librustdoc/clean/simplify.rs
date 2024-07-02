@@ -90,10 +90,10 @@ pub(crate) fn merge_bounds(
         let last = trait_ref.trait_.segments.last_mut().expect("segments were empty");
 
         match last.args {
-            PP::AngleBracketed { ref mut bindings, .. } => {
-                bindings.push(clean::TypeBinding {
+            PP::AngleBracketed { ref mut constraints, .. } => {
+                constraints.push(clean::AssocItemConstraint {
                     assoc: assoc.clone(),
-                    kind: clean::TypeBindingKind::Equality { term: rhs.clone() },
+                    kind: clean::AssocItemConstraintKind::Equality { term: rhs.clone() },
                 });
             }
             PP::Parenthesized { ref mut output, .. } => match output {
@@ -113,7 +113,7 @@ fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId)
     if child == trait_ {
         return true;
     }
-    let predicates = cx.tcx.super_predicates_of(child);
+    let predicates = cx.tcx.explicit_super_predicates_of(child);
     debug_assert!(cx.tcx.generics_of(child).has_self);
     let self_ty = cx.tcx.types.self_param;
     predicates

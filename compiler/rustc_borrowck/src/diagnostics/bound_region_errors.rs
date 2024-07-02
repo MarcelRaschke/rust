@@ -1,4 +1,5 @@
 use rustc_errors::Diag;
+use rustc_hir::def_id::LocalDefId;
 use rustc_infer::infer::canonical::Canonical;
 use rustc_infer::infer::error_reporting::nice_region_error::NiceRegionError;
 use rustc_infer::infer::region_constraints::Constraint;
@@ -51,7 +52,7 @@ impl<'tcx> UniverseInfo<'tcx> {
 
     pub(crate) fn report_error(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, '_, 'tcx>,
         placeholder: ty::PlaceholderRegion,
         error_element: RegionElement,
         cause: ObligationCause<'tcx>,
@@ -148,18 +149,18 @@ trait TypeOpInfo<'tcx> {
 
     fn base_universe(&self) -> ty::UniverseIndex;
 
-    fn nice_error(
+    fn nice_error<'infcx>(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, 'infcx, 'tcx>,
         cause: ObligationCause<'tcx>,
         placeholder_region: ty::Region<'tcx>,
         error_region: Option<ty::Region<'tcx>>,
-    ) -> Option<Diag<'tcx>>;
+    ) -> Option<Diag<'infcx>>;
 
     #[instrument(level = "debug", skip(self, mbcx))]
     fn report_error(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, '_, 'tcx>,
         placeholder: ty::PlaceholderRegion,
         error_element: RegionElement,
         cause: ObligationCause<'tcx>,
@@ -230,18 +231,25 @@ impl<'tcx> TypeOpInfo<'tcx> for PredicateQuery<'tcx> {
         self.base_universe
     }
 
-    fn nice_error(
+    fn nice_error<'infcx>(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, 'infcx, 'tcx>,
         cause: ObligationCause<'tcx>,
         placeholder_region: ty::Region<'tcx>,
         error_region: Option<ty::Region<'tcx>>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Option<Diag<'infcx>> {
         let (infcx, key, _) =
             mbcx.infcx.tcx.infer_ctxt().build_with_canonical(cause.span, &self.canonical_query);
         let ocx = ObligationCtxt::new(&infcx);
         type_op_prove_predicate_with_cause(&ocx, key, cause);
-        try_extract_error_from_fulfill_cx(&ocx, placeholder_region, error_region)
+        let diag = try_extract_error_from_fulfill_cx(
+            &ocx,
+            mbcx.mir_def_id(),
+            placeholder_region,
+            error_region,
+        )?
+        .with_dcx(mbcx.dcx());
+        Some(diag)
     }
 }
 
@@ -267,13 +275,13 @@ where
         self.base_universe
     }
 
-    fn nice_error(
+    fn nice_error<'infcx>(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, 'infcx, 'tcx>,
         cause: ObligationCause<'tcx>,
         placeholder_region: ty::Region<'tcx>,
         error_region: Option<ty::Region<'tcx>>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Option<Diag<'infcx>> {
         let (infcx, key, _) =
             mbcx.infcx.tcx.infer_ctxt().build_with_canonical(cause.span, &self.canonical_query);
         let ocx = ObligationCtxt::new(&infcx);
@@ -287,7 +295,14 @@ where
         let (param_env, value) = key.into_parts();
         let _ = ocx.normalize(&cause, param_env, value.value);
 
-        try_extract_error_from_fulfill_cx(&ocx, placeholder_region, error_region)
+        let diag = try_extract_error_from_fulfill_cx(
+            &ocx,
+            mbcx.mir_def_id(),
+            placeholder_region,
+            error_region,
+        )?
+        .with_dcx(mbcx.dcx());
+        Some(diag)
     }
 }
 
@@ -307,18 +322,25 @@ impl<'tcx> TypeOpInfo<'tcx> for AscribeUserTypeQuery<'tcx> {
         self.base_universe
     }
 
-    fn nice_error(
+    fn nice_error<'infcx>(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, 'infcx, 'tcx>,
         cause: ObligationCause<'tcx>,
         placeholder_region: ty::Region<'tcx>,
         error_region: Option<ty::Region<'tcx>>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Option<Diag<'infcx>> {
         let (infcx, key, _) =
             mbcx.infcx.tcx.infer_ctxt().build_with_canonical(cause.span, &self.canonical_query);
         let ocx = ObligationCtxt::new(&infcx);
         type_op_ascribe_user_type_with_span(&ocx, key, Some(cause.span)).ok()?;
-        try_extract_error_from_fulfill_cx(&ocx, placeholder_region, error_region)
+        let diag = try_extract_error_from_fulfill_cx(
+            &ocx,
+            mbcx.mir_def_id(),
+            placeholder_region,
+            error_region,
+        )?
+        .with_dcx(mbcx.dcx());
+        Some(diag)
     }
 }
 
@@ -333,15 +355,16 @@ impl<'tcx> TypeOpInfo<'tcx> for crate::type_check::InstantiateOpaqueType<'tcx> {
         self.base_universe.unwrap()
     }
 
-    fn nice_error(
+    fn nice_error<'infcx>(
         &self,
-        mbcx: &mut MirBorrowckCtxt<'_, 'tcx>,
+        mbcx: &mut MirBorrowckCtxt<'_, '_, 'infcx, 'tcx>,
         _cause: ObligationCause<'tcx>,
         placeholder_region: ty::Region<'tcx>,
         error_region: Option<ty::Region<'tcx>>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Option<Diag<'infcx>> {
         try_extract_error_from_region_constraints(
             mbcx.infcx,
+            mbcx.mir_def_id(),
             placeholder_region,
             error_region,
             self.region_constraints.as_ref().unwrap(),
@@ -356,11 +379,12 @@ impl<'tcx> TypeOpInfo<'tcx> for crate::type_check::InstantiateOpaqueType<'tcx> {
 }
 
 #[instrument(skip(ocx), level = "debug")]
-fn try_extract_error_from_fulfill_cx<'tcx>(
-    ocx: &ObligationCtxt<'_, 'tcx>,
+fn try_extract_error_from_fulfill_cx<'a, 'tcx>(
+    ocx: &ObligationCtxt<'a, 'tcx>,
+    generic_param_scope: LocalDefId,
     placeholder_region: ty::Region<'tcx>,
     error_region: Option<ty::Region<'tcx>>,
-) -> Option<Diag<'tcx>> {
+) -> Option<Diag<'a>> {
     // We generally shouldn't have errors here because the query was
     // already run, but there's no point using `span_delayed_bug`
     // when we're going to emit an error here anyway.
@@ -368,6 +392,7 @@ fn try_extract_error_from_fulfill_cx<'tcx>(
     let region_constraints = ocx.infcx.with_region_constraints(|r| r.clone());
     try_extract_error_from_region_constraints(
         ocx.infcx,
+        generic_param_scope,
         placeholder_region,
         error_region,
         &region_constraints,
@@ -377,14 +402,15 @@ fn try_extract_error_from_fulfill_cx<'tcx>(
 }
 
 #[instrument(level = "debug", skip(infcx, region_var_origin, universe_of_region))]
-fn try_extract_error_from_region_constraints<'tcx>(
-    infcx: &InferCtxt<'tcx>,
+fn try_extract_error_from_region_constraints<'a, 'tcx>(
+    infcx: &'a InferCtxt<'tcx>,
+    generic_param_scope: LocalDefId,
     placeholder_region: ty::Region<'tcx>,
     error_region: Option<ty::Region<'tcx>>,
     region_constraints: &RegionConstraintData<'tcx>,
     mut region_var_origin: impl FnMut(RegionVid) -> RegionVariableOrigin,
     mut universe_of_region: impl FnMut(RegionVid) -> UniverseIndex,
-) -> Option<Diag<'tcx>> {
+) -> Option<Diag<'a>> {
     let placeholder_universe = match placeholder_region.kind() {
         ty::RePlaceholder(p) => p.universe,
         ty::ReVar(vid) => universe_of_region(vid),
@@ -452,15 +478,18 @@ fn try_extract_error_from_region_constraints<'tcx>(
             RegionResolutionError::ConcreteFailure(cause.clone(), sub_region, placeholder_region)
         }
     };
-    NiceRegionError::new(&infcx.err_ctxt(), error).try_report_from_nll().or_else(|| {
-        if let SubregionOrigin::Subtype(trace) = cause {
-            Some(
-                infcx
-                    .err_ctxt()
-                    .report_and_explain_type_error(*trace, TypeError::RegionsPlaceholderMismatch),
-            )
-        } else {
-            None
-        }
-    })
+    NiceRegionError::new(&infcx.err_ctxt(), generic_param_scope, error)
+        .try_report_from_nll()
+        .or_else(|| {
+            if let SubregionOrigin::Subtype(trace) = cause {
+                Some(
+                    infcx.err_ctxt().report_and_explain_type_error(
+                        *trace,
+                        TypeError::RegionsPlaceholderMismatch,
+                    ),
+                )
+            } else {
+                None
+            }
+        })
 }

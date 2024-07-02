@@ -18,11 +18,11 @@ use rustc_ast::Recovered;
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::UnordMap;
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, StashKey};
-use rustc_hir as hir;
+use rustc_errors::{struct_span_code_err, Applicability, Diag, ErrorGuaranteed, StashKey, E0228};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::intravisit::{self, walk_generics, Visitor};
+use rustc_hir::{self as hir};
 use rustc_hir::{GenericParamKind, Node};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_infer::traits::ObligationCause;
@@ -44,9 +44,9 @@ use std::ops::Bound;
 
 use crate::check::intrinsic::intrinsic_operation_unsafety;
 use crate::errors;
-use crate::hir_ty_lowering::HirTyLowerer;
-pub use type_of::test_opaque_hidden_types;
+use crate::hir_ty_lowering::{HirTyLowerer, RegionInferReason};
 
+pub(crate) mod dump;
 mod generics_of;
 mod item_bounds;
 mod predicates_of;
@@ -70,10 +70,10 @@ pub fn provide(providers: &mut Providers) {
         predicates_of: predicates_of::predicates_of,
         predicates_defined_on,
         explicit_predicates_of: predicates_of::explicit_predicates_of,
-        super_predicates_of: predicates_of::super_predicates_of,
-        implied_predicates_of: predicates_of::implied_predicates_of,
-        super_predicates_that_define_assoc_item:
-            predicates_of::super_predicates_that_define_assoc_item,
+        explicit_super_predicates_of: predicates_of::explicit_super_predicates_of,
+        explicit_implied_predicates_of: predicates_of::explicit_implied_predicates_of,
+        explicit_supertraits_containing_assoc_item:
+            predicates_of::explicit_supertraits_containing_assoc_item,
         trait_explicit_predicates_and_bounds: predicates_of::trait_explicit_predicates_and_bounds,
         type_param_predicates: predicates_of::type_param_predicates,
         trait_def,
@@ -370,32 +370,34 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         self.tcx
     }
 
-    fn item_def_id(&self) -> DefId {
-        self.item_def_id.to_def_id()
+    fn item_def_id(&self) -> LocalDefId {
+        self.item_def_id
     }
 
-    fn allow_infer(&self) -> bool {
-        false
-    }
-
-    fn re_infer(&self, _: Option<&ty::GenericParamDef>, _: Span) -> Option<ty::Region<'tcx>> {
-        None
+    fn re_infer(&self, span: Span, reason: RegionInferReason<'_>) -> ty::Region<'tcx> {
+        if let RegionInferReason::BorrowedObjectLifetimeDefault = reason {
+            let e = struct_span_code_err!(
+                self.tcx().dcx(),
+                span,
+                E0228,
+                "the lifetime bound for this object type cannot be deduced \
+                from context; please supply an explicit bound"
+            )
+            .emit();
+            self.set_tainted_by_errors(e);
+            ty::Region::new_error(self.tcx(), e)
+        } else {
+            // This indicates an illegal lifetime in a non-assoc-trait position
+            ty::Region::new_error_with_message(self.tcx(), span, "unelided lifetime in signature")
+        }
     }
 
     fn ty_infer(&self, _: Option<&ty::GenericParamDef>, span: Span) -> Ty<'tcx> {
         Ty::new_error_with_message(self.tcx(), span, "bad placeholder type")
     }
 
-    fn ct_infer(&self, ty: Ty<'tcx>, _: Option<&ty::GenericParamDef>, span: Span) -> Const<'tcx> {
-        let ty = self.tcx.fold_regions(ty, |r, _| match *r {
-            rustc_type_ir::RegionKind::ReStatic => r,
-
-            // This is never reached in practice. If it ever is reached,
-            // `ReErased` should be changed to `ReStatic`, and any other region
-            // left alone.
-            r => bug!("unexpected region: {r:?}"),
-        });
-        ty::Const::new_error_with_message(self.tcx(), ty, span, "bad placeholder constant")
+    fn ct_infer(&self, _: Option<&ty::GenericParamDef>, span: Span) -> Const<'tcx> {
+        ty::Const::new_error_with_message(self.tcx(), span, "bad placeholder constant")
     }
 
     fn probe_ty_param_bounds(
@@ -421,7 +423,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
                 item_segment,
                 trait_ref.args,
             );
-            Ty::new_projection(self.tcx(), item_def_id, item_args)
+            Ty::new_projection_from_args(self.tcx(), item_def_id, item_args)
         } else {
             // There are no late-bound regions; we can just ignore the binder.
             let (mut mpart_sugg, mut inferred_sugg) = (None, None);
@@ -453,7 +455,6 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
                                         poly_trait_ref,
                                         |_| {
                                             ty::Region::new_early_param(self.tcx, ty::EarlyParamRegion {
-                                                def_id: item_def_id,
                                                 index: 0,
                                                 name: Symbol::intern(&lt_name),
                                             })
@@ -510,6 +511,89 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
 
     fn set_tainted_by_errors(&self, err: ErrorGuaranteed) {
         self.tainted_by_errors.set(Some(err));
+    }
+
+    fn lower_fn_sig(
+        &self,
+        decl: &hir::FnDecl<'tcx>,
+        generics: Option<&hir::Generics<'_>>,
+        hir_id: rustc_hir::HirId,
+        hir_ty: Option<&hir::Ty<'_>>,
+    ) -> (Vec<Ty<'tcx>>, Ty<'tcx>) {
+        let tcx = self.tcx();
+        // We proactively collect all the inferred type params to emit a single error per fn def.
+        let mut visitor = HirPlaceholderCollector::default();
+        let mut infer_replacements = vec![];
+
+        if let Some(generics) = generics {
+            walk_generics(&mut visitor, generics);
+        }
+
+        let input_tys = decl
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if let hir::TyKind::Infer = a.kind {
+                    if let Some(suggested_ty) =
+                        self.lowerer().suggest_trait_fn_ty_for_impl_fn_infer(hir_id, Some(i))
+                    {
+                        infer_replacements.push((a.span, suggested_ty.to_string()));
+                        return Ty::new_error_with_message(tcx, a.span, suggested_ty.to_string());
+                    }
+                }
+
+                // Only visit the type looking for `_` if we didn't fix the type above
+                visitor.visit_ty(a);
+                self.lowerer().lower_arg_ty(a, None)
+            })
+            .collect();
+
+        let output_ty = match decl.output {
+            hir::FnRetTy::Return(output) => {
+                if let hir::TyKind::Infer = output.kind
+                    && let Some(suggested_ty) =
+                        self.lowerer().suggest_trait_fn_ty_for_impl_fn_infer(hir_id, None)
+                {
+                    infer_replacements.push((output.span, suggested_ty.to_string()));
+                    Ty::new_error_with_message(tcx, output.span, suggested_ty.to_string())
+                } else {
+                    visitor.visit_ty(output);
+                    self.lower_ty(output)
+                }
+            }
+            hir::FnRetTy::DefaultReturn(..) => tcx.types.unit,
+        };
+
+        if !(visitor.0.is_empty() && infer_replacements.is_empty()) {
+            // We check for the presence of
+            // `ident_span` to not emit an error twice when we have `fn foo(_: fn() -> _)`.
+
+            let mut diag = crate::collect::placeholder_type_error_diag(
+                tcx,
+                generics,
+                visitor.0,
+                infer_replacements.iter().map(|(s, _)| *s).collect(),
+                true,
+                hir_ty,
+                "function",
+            );
+
+            if !infer_replacements.is_empty() {
+                diag.multipart_suggestion(
+                    format!(
+                    "try replacing `_` with the type{} in the corresponding trait method signature",
+                    rustc_errors::pluralize!(infer_replacements.len()),
+                ),
+                    infer_replacements,
+                    Applicability::MachineApplicable,
+                );
+            }
+
+            self.set_tainted_by_errors(diag.emit());
+        }
+
+        (input_tys, output_ty)
     }
 }
 
@@ -607,14 +691,14 @@ fn lower_item(tcx: TyCtxt<'_>, item_id: hir::ItemId) {
         hir::ItemKind::Trait(..) => {
             tcx.ensure().generics_of(def_id);
             tcx.ensure().trait_def(def_id);
-            tcx.at(it.span).super_predicates_of(def_id);
+            tcx.at(it.span).explicit_super_predicates_of(def_id);
             tcx.ensure().predicates_of(def_id);
             tcx.ensure().associated_items(def_id);
         }
         hir::ItemKind::TraitAlias(..) => {
             tcx.ensure().generics_of(def_id);
-            tcx.at(it.span).implied_predicates_of(def_id);
-            tcx.at(it.span).super_predicates_of(def_id);
+            tcx.at(it.span).explicit_implied_predicates_of(def_id);
+            tcx.at(it.span).explicit_super_predicates_of(def_id);
             tcx.ensure().predicates_of(def_id);
         }
         hir::ItemKind::Struct(struct_def, _) | hir::ItemKind::Union(struct_def, _) => {
@@ -1117,8 +1201,24 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
 
     let is_marker = tcx.has_attr(def_id, sym::marker);
     let rustc_coinductive = tcx.has_attr(def_id, sym::rustc_coinductive);
-    let skip_array_during_method_dispatch =
-        tcx.has_attr(def_id, sym::rustc_skip_array_during_method_dispatch);
+
+    // FIXME: We could probably do way better attribute validation here.
+    let mut skip_array_during_method_dispatch = false;
+    let mut skip_boxed_slice_during_method_dispatch = false;
+    for attr in tcx.get_attrs(def_id, sym::rustc_skip_during_method_dispatch) {
+        if let Some(lst) = attr.meta_item_list() {
+            for item in lst {
+                if let Some(ident) = item.ident() {
+                    match ident.as_str() {
+                        "array" => skip_array_during_method_dispatch = true,
+                        "boxed_slice" => skip_boxed_slice_during_method_dispatch = true,
+                        _ => (),
+                    }
+                }
+            }
+        }
+    }
+
     let specialization_kind = if tcx.has_attr(def_id, sym::rustc_unsafe_specialization_marker) {
         ty::trait_def::TraitSpecializationKind::Marker
     } else if tcx.has_attr(def_id, sym::rustc_specialization_trait) {
@@ -1253,6 +1353,7 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
         is_marker,
         is_coinductive: rustc_coinductive || is_auto,
         skip_array_during_method_dispatch,
+        skip_boxed_slice_during_method_dispatch,
         specialization_kind,
         must_implement_one_of,
         implement_via_object,
@@ -1261,7 +1362,7 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
 }
 
 #[instrument(level = "debug", skip(tcx))]
-fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<ty::PolyFnSig<'_>> {
+fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_, ty::PolyFnSig<'_>> {
     use rustc_hir::Node::*;
     use rustc_hir::*;
 
@@ -1305,9 +1406,11 @@ fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<ty::PolyFnSig<
             icx.lowerer().lower_fn_ty(hir_id, header.safety, header.abi, decl, Some(generics), None)
         }
 
-        ForeignItem(&hir::ForeignItem { kind: ForeignItemKind::Fn(fn_decl, _, _), .. }) => {
+        ForeignItem(&hir::ForeignItem {
+            kind: ForeignItemKind::Fn(fn_decl, _, _, safety), ..
+        }) => {
             let abi = tcx.hir().get_foreign_abi(hir_id);
-            compute_sig_of_foreign_fn_decl(tcx, def_id, fn_decl, abi)
+            compute_sig_of_foreign_fn_decl(tcx, def_id, fn_decl, abi, safety)
         }
 
         Ctor(data) | Variant(hir::Variant { data, .. }) if data.ctor().is_some() => {
@@ -1356,8 +1459,25 @@ fn infer_return_ty_for_fn_sig<'tcx>(
         Some(ty) => {
             let fn_sig = tcx.typeck(def_id).liberated_fn_sigs()[hir_id];
             // Typeck doesn't expect erased regions to be returned from `type_of`.
+            // This is a heuristic approach. If the scope has region paramters,
+            // we should change fn_sig's lifetime from `ReErased` to `ReError`,
+            // otherwise to `ReStatic`.
+            let has_region_params = generics.params.iter().any(|param| match param.kind {
+                GenericParamKind::Lifetime { .. } => true,
+                _ => false,
+            });
             let fn_sig = tcx.fold_regions(fn_sig, |r, _| match *r {
-                ty::ReErased => tcx.lifetimes.re_static,
+                ty::ReErased => {
+                    if has_region_params {
+                        ty::Region::new_error_with_message(
+                            tcx,
+                            DUMMY_SP,
+                            "erased region is not allowed here in return type",
+                        )
+                    } else {
+                        tcx.lifetimes.re_static
+                    }
+                }
                 _ => r,
             });
 
@@ -1462,7 +1582,7 @@ pub fn suggest_impl_trait<'tcx>(
         ),
         (
             infcx.tcx.lang_items().future_trait(),
-            infcx.tcx.get_diagnostic_item(sym::FutureOutput),
+            infcx.tcx.lang_items().future_output(),
             format_as_assoc,
         ),
         (
@@ -1504,7 +1624,7 @@ pub fn suggest_impl_trait<'tcx>(
             let item_ty = ocx.normalize(
                 &ObligationCause::dummy(),
                 param_env,
-                Ty::new_projection(infcx.tcx, assoc_item_def_id, args),
+                Ty::new_projection_from_args(infcx.tcx, assoc_item_def_id, args),
             );
             // FIXME(compiler-errors): We may benefit from resolving regions here.
             if ocx.select_where_possible().is_empty()
@@ -1535,44 +1655,19 @@ fn impl_trait_header(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::ImplTrai
     let icx = ItemCtxt::new(tcx, def_id);
     let item = tcx.hir().expect_item(def_id);
     let impl_ = item.expect_impl();
-    impl_
-        .of_trait
-        .as_ref()
-        .map(|hir_trait_ref| {
-            let self_ty = tcx.type_of(def_id).instantiate_identity();
+    impl_.of_trait.as_ref().map(|ast_trait_ref| {
+        let selfty = tcx.type_of(def_id).instantiate_identity();
 
-            let trait_ref = if let Some(ErrorGuaranteed { .. }) = check_impl_constness(
-                tcx,
-                tcx.is_const_trait_impl_raw(def_id.to_def_id()),
-                hir_trait_ref,
-            ) {
-                // we have a const impl, but for a trait without `#[const_trait]`, so
-                // without the host param. If we continue with the HIR trait ref, we get
-                // ICEs for generic arg count mismatch. We do a little HIR editing to
-                // make HIR ty lowering happy.
-                let mut path_segments = hir_trait_ref.path.segments.to_vec();
-                let last_segment = path_segments.len() - 1;
-                let mut args = *path_segments[last_segment].args();
-                let last_arg = args.args.len() - 1;
-                assert!(matches!(args.args[last_arg], hir::GenericArg::Const(anon_const) if anon_const.is_desugared_from_effects));
-                args.args = &args.args[..args.args.len() - 1];
-                path_segments[last_segment].args = Some(tcx.hir_arena.alloc(args));
-                let path = hir::Path {
-                    span: hir_trait_ref.path.span,
-                    res: hir_trait_ref.path.res,
-                    segments: tcx.hir_arena.alloc_slice(&path_segments),
-                };
-                let trait_ref = tcx.hir_arena.alloc(hir::TraitRef { path: tcx.hir_arena.alloc(path), hir_ref_id: hir_trait_ref.hir_ref_id });
-                icx.lowerer().lower_impl_trait_ref(trait_ref, self_ty)
-            } else {
-                icx.lowerer().lower_impl_trait_ref(hir_trait_ref, self_ty)
-            };
-            ty::ImplTraitHeader {
-                trait_ref: ty::EarlyBinder::bind(trait_ref),
-                safety: impl_.safety,
-                polarity: polarity_of_impl(tcx, def_id, impl_, item.span)
-            }
-        })
+        check_impl_constness(tcx, tcx.is_const_trait_impl_raw(def_id.to_def_id()), ast_trait_ref);
+
+        let trait_ref = icx.lowerer().lower_impl_trait_ref(ast_trait_ref, selfty);
+
+        ty::ImplTraitHeader {
+            trait_ref: ty::EarlyBinder::bind(trait_ref),
+            safety: impl_.safety,
+            polarity: polarity_of_impl(tcx, def_id, impl_, item.span),
+        }
+    })
 }
 
 fn check_impl_constness(
@@ -1679,11 +1774,12 @@ fn compute_sig_of_foreign_fn_decl<'tcx>(
     def_id: LocalDefId,
     decl: &'tcx hir::FnDecl<'tcx>,
     abi: abi::Abi,
+    safety: hir::Safety,
 ) -> ty::PolyFnSig<'tcx> {
     let safety = if abi == abi::Abi::RustIntrinsic {
         intrinsic_operation_unsafety(tcx, def_id)
     } else {
-        hir::Safety::Unsafe
+        safety
     };
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
     let fty =

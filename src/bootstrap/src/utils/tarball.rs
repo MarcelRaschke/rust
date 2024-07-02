@@ -5,14 +5,12 @@
 //! In uplifting, a tarball from Stage N captures essential components
 //! to assemble Stage N + 1 compiler.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use crate::core::builder::Builder;
 use crate::core::{build_steps::dist::distdir, builder::Kind};
 use crate::utils::channel;
+use crate::utils::exec::BootstrapCommand;
 use crate::utils::helpers::{move_file, t};
 
 #[derive(Copy, Clone)]
@@ -23,7 +21,6 @@ pub(crate) enum OverlayKind {
     Clippy,
     Miri,
     Rustfmt,
-    RustDemangler,
     Rls,
     RustAnalyzer,
     RustcCodegenCranelift,
@@ -58,9 +55,6 @@ impl OverlayKind {
                 "src/tools/rustfmt/LICENSE-APACHE",
                 "src/tools/rustfmt/LICENSE-MIT",
             ],
-            OverlayKind::RustDemangler => {
-                &["src/tools/rust-demangler/README.md", "LICENSE-APACHE", "LICENSE-MIT"]
-            }
             OverlayKind::Rls => &["src/tools/rls/README.md", "LICENSE-APACHE", "LICENSE-MIT"],
             OverlayKind::RustAnalyzer => &[
                 "src/tools/rust-analyzer/README.md",
@@ -85,7 +79,6 @@ impl OverlayKind {
         match self {
             OverlayKind::Rust => builder.rust_version(),
             OverlayKind::Llvm => builder.rust_version(),
-            OverlayKind::RustDemangler => builder.release_num("rust-demangler"),
             OverlayKind::Cargo => {
                 builder.cargo_info.version(builder, &builder.release_num("cargo"))
             }
@@ -305,7 +298,7 @@ impl<'a> Tarball<'a> {
         }
     }
 
-    fn non_bare_args(&self, cmd: &mut Command) {
+    fn non_bare_args(&self, cmd: &mut BootstrapCommand) {
         cmd.arg("--rel-manifest-dir=rustlib")
             .arg("--legacy-manifest-dirs=rustlib,cargo")
             .arg(format!("--product-name={}", self.product_name))
@@ -317,7 +310,7 @@ impl<'a> Tarball<'a> {
             .arg(distdir(self.builder));
     }
 
-    fn run(self, build_cli: impl FnOnce(&Tarball<'a>, &mut Command)) -> GeneratedTarball {
+    fn run(self, build_cli: impl FnOnce(&Tarball<'a>, &mut BootstrapCommand)) -> GeneratedTarball {
         t!(std::fs::create_dir_all(&self.overlay_dir));
         self.builder.create(&self.overlay_dir.join("version"), &self.overlay.version(self.builder));
         if let Some(info) = self.builder.rust_info().info() {
@@ -358,7 +351,7 @@ impl<'a> Tarball<'a> {
         };
 
         cmd.args(["--compression-profile", compression_profile]);
-        self.builder.run(&mut cmd);
+        self.builder.run(cmd);
 
         // Ensure there are no symbolic links in the tarball. In particular,
         // rustup-toolchain-install-master and most versions of Windows can't handle symbolic links.

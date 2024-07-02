@@ -86,7 +86,7 @@ use ide_db::{
     label::Label,
     source_change::SourceChange,
     syntax_helpers::node_ext::parse_tt_as_comma_sep_paths,
-    FxHashMap, FxHashSet, RootDatabase,
+    FxHashMap, FxHashSet, RootDatabase, SnippetCap,
 };
 use once_cell::sync::Lazy;
 use stdx::never;
@@ -229,9 +229,11 @@ pub struct DiagnosticsConfig {
     pub expr_fill_default: ExprFillDefaultMode,
     pub style_lints: bool,
     // FIXME: We may want to include a whole `AssistConfig` here
+    pub snippet_cap: Option<SnippetCap>,
     pub insert_use: InsertUseConfig,
     pub prefer_no_std: bool,
     pub prefer_prelude: bool,
+    pub term_search_fuel: u64,
 }
 
 impl DiagnosticsConfig {
@@ -247,6 +249,7 @@ impl DiagnosticsConfig {
             disabled: Default::default(),
             expr_fill_default: Default::default(),
             style_lints: true,
+            snippet_cap: SnippetCap::new(true),
             insert_use: InsertUseConfig {
                 granularity: ImportGranularity::Preserve,
                 enforce_granularity: false,
@@ -256,6 +259,7 @@ impl DiagnosticsConfig {
             },
             prefer_no_std: false,
             prefer_prelude: true,
+            term_search_fuel: 400,
         }
     }
 }
@@ -295,13 +299,12 @@ pub fn diagnostics(
     resolve: &AssistResolveStrategy,
     file_id: FileId,
 ) -> Vec<Diagnostic> {
-    let _p = tracing::span!(tracing::Level::INFO, "diagnostics").entered();
+    let _p = tracing::info_span!("diagnostics").entered();
     let sema = Semantics::new(db);
-    let parse = db.parse(file_id);
     let mut res = Vec::new();
 
     // [#34344] Only take first 128 errors to prevent slowing down editor/ide, the number 128 is chosen arbitrarily.
-    res.extend(parse.errors().into_iter().take(128).map(|err| {
+    res.extend(db.parse_errors(file_id).as_deref().into_iter().flatten().take(128).map(|err| {
         Diagnostic::new(
             DiagnosticCode::RustcHardError("syntax-error"),
             format!("Syntax Error: {err}"),
@@ -340,7 +343,8 @@ pub fn diagnostics(
             AnyDiagnostic::MacroDefError(d) => handlers::macro_error::macro_def_error(&ctx, &d),
             AnyDiagnostic::MacroError(d) => handlers::macro_error::macro_error(&ctx, &d),
             AnyDiagnostic::MacroExpansionParseError(d) => {
-                res.extend(d.errors.iter().take(32).map(|err| {
+                // FIXME: Point to the correct error span here, not just the macro-call name
+                res.extend(d.errors.iter().take(16).map(|err| {
                     {
                         Diagnostic::new(
                             DiagnosticCode::RustcHardError("syntax-error"),
@@ -480,7 +484,7 @@ fn handle_lint_attributes(
     clippy_stack: &mut FxHashMap<String, Vec<Severity>>,
     diagnostics_of_range: &mut FxHashMap<InFile<SyntaxNode>, &mut Diagnostic>,
 ) {
-    let _g = tracing::span!(tracing::Level::INFO, "handle_lint_attributes").entered();
+    let _g = tracing::info_span!("handle_lint_attributes").entered();
     let file_id = sema.hir_file_for(root);
     let preorder = root.preorder();
     for ev in preorder {

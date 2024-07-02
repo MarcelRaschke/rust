@@ -136,15 +136,15 @@ impl From<ast::LiteralKind> for Literal {
                 Literal::Float(FloatTypeWrapper::new(lit.value().unwrap_or(Default::default())), ty)
             }
             LiteralKind::ByteString(bs) => {
-                let text = bs.value().map(Box::from).unwrap_or_else(Default::default);
+                let text = bs.value().map_or_else(|_| Default::default(), Box::from);
                 Literal::ByteString(text)
             }
             LiteralKind::String(s) => {
-                let text = s.value().map(Box::from).unwrap_or_else(Default::default);
+                let text = s.value().map_or_else(|_| Default::default(), Box::from);
                 Literal::String(text)
             }
             LiteralKind::CString(s) => {
-                let text = s.value().map(Box::from).unwrap_or_else(Default::default);
+                let text = s.value().map_or_else(|_| Default::default(), Box::from);
                 Literal::CString(text)
             }
             LiteralKind::Byte(b) => {
@@ -503,11 +503,11 @@ impl BindingAnnotation {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BindingProblems {
-    /// https://doc.rust-lang.org/stable/error_codes/E0416.html
+    /// <https://doc.rust-lang.org/stable/error_codes/E0416.html>
     BoundMoreThanOnce,
-    /// https://doc.rust-lang.org/stable/error_codes/E0409.html
+    /// <https://doc.rust-lang.org/stable/error_codes/E0409.html>
     BoundInconsistently,
-    /// https://doc.rust-lang.org/stable/error_codes/E0408.html
+    /// <https://doc.rust-lang.org/stable/error_codes/E0408.html>
     NotBoundAcrossAll,
 }
 

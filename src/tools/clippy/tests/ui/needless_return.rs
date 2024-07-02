@@ -1,4 +1,3 @@
-#![feature(lint_reasons)]
 #![feature(yeet_expr)]
 #![allow(unused)]
 #![allow(
@@ -331,6 +330,10 @@ fn allow_works() -> i32 {
     match () {
         () => return 42,
     }
+}
+
+fn conjunctive_blocks() -> String {
+    return { "a".to_string() } + "b" + { "c" };
 }
 
 fn main() {}

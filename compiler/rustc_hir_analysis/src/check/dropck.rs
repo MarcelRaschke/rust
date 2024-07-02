@@ -1,6 +1,7 @@
 // FIXME(@lcnr): Move this module out of `rustc_hir_analysis`.
 //
 // We don't do any drop checking during hir typeck.
+
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{codes::*, struct_span_code_err, ErrorGuaranteed};
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
@@ -123,7 +124,7 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
     adt_to_impl_args: GenericArgsRef<'tcx>,
 ) -> Result<(), ErrorGuaranteed> {
     let infcx = tcx.infer_ctxt().build();
-    let ocx = ObligationCtxt::new(&infcx);
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
 
     // Take the param-env of the adt and instantiate the args that show up in
     // the implementation's self type. This gives us the assumptions that the

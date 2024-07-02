@@ -23,7 +23,7 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::str;
 use std::sync::OnceLock;
 
@@ -41,7 +41,7 @@ use crate::core::builder::Kind;
 use crate::core::config::{flags, LldMode};
 use crate::core::config::{DryRun, Target};
 use crate::core::config::{LlvmLibunwind, TargetSelection};
-use crate::utils::exec::{BehaviorOnFailure, BootstrapCommand, OutputMode};
+use crate::utils::exec::{BehaviorOnFailure, BootstrapCommand, CommandOutput, OutputMode};
 use crate::utils::helpers::{self, dir_is_empty, exe, libdir, mtime, output, symlink_dir};
 
 mod core;
@@ -74,7 +74,7 @@ const LLVM_TOOLS: &[&str] = &[
 /// LLD file names for all flavors.
 const LLD_FILE_NAMES: &[&str] = &["ld.lld", "ld64.lld", "lld-link", "wasm-ld"];
 
-/// Extra --check-cfg to add when building
+/// Extra `--check-cfg` to add when building the compiler or tools
 /// (Mode restriction, config name, config values (if any))
 #[allow(clippy::type_complexity)] // It's fine for hard-coded list and type is explained above.
 const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
@@ -84,37 +84,9 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
     (Some(Mode::ToolRustc), "rust_analyzer", None),
     (Some(Mode::ToolStd), "rust_analyzer", None),
     (Some(Mode::Codegen), "parallel_compiler", None),
-    (Some(Mode::Std), "stdarch_intel_sde", None),
-    (Some(Mode::Std), "no_fp_fmt_parse", None),
-    (Some(Mode::Std), "no_global_oom_handling", None),
-    (Some(Mode::Std), "no_rc", None),
-    (Some(Mode::Std), "no_sync", None),
-    (Some(Mode::Std), "netbsd10", None),
-    (Some(Mode::Std), "backtrace_in_libstd", None),
-    /* Extra values not defined in the built-in targets yet, but used in std */
-    (Some(Mode::Std), "target_env", Some(&["libnx", "p2"])),
-    (Some(Mode::Std), "target_os", Some(&["visionos"])),
-    (Some(Mode::Std), "target_arch", Some(&["arm64ec", "spirv", "nvptx", "xtensa"])),
-    (Some(Mode::ToolStd), "target_os", Some(&["visionos"])),
-    /* Extra names used by dependencies */
-    // FIXME: Used by serde_json, but we should not be triggering on external dependencies.
-    (Some(Mode::Rustc), "no_btreemap_remove_entry", None),
-    (Some(Mode::ToolRustc), "no_btreemap_remove_entry", None),
-    // FIXME: Used by crossbeam-utils, but we should not be triggering on external dependencies.
-    (Some(Mode::Rustc), "crossbeam_loom", None),
-    (Some(Mode::ToolRustc), "crossbeam_loom", None),
-    // FIXME: Used by proc-macro2, but we should not be triggering on external dependencies.
-    (Some(Mode::Rustc), "span_locations", None),
-    (Some(Mode::ToolRustc), "span_locations", None),
-    // FIXME: Used by rustix, but we should not be triggering on external dependencies.
-    (Some(Mode::Rustc), "rustix_use_libc", None),
-    (Some(Mode::ToolRustc), "rustix_use_libc", None),
-    // FIXME: Used by filetime, but we should not be triggering on external dependencies.
-    (Some(Mode::Rustc), "emulate_second_only_system", None),
-    (Some(Mode::ToolRustc), "emulate_second_only_system", None),
-    // Needed to avoid the need to copy windows.lib into the sysroot.
-    (Some(Mode::Rustc), "windows_raw_dylib", None),
-    (Some(Mode::ToolRustc), "windows_raw_dylib", None),
+    // Any library specific cfgs like `target_os`, `target_arch` should be put in
+    // priority the `[lints.rust.unexpected_cfgs.check-cfg]` table
+    // in the appropriate `library/{std,alloc,core}/Cargo.toml`
 ];
 
 /// A structure representing a Rust compiler.
@@ -468,7 +440,7 @@ impl Build {
 
             // Make sure we update these before gathering metadata so we don't get an error about missing
             // Cargo.toml files.
-            let rust_submodules = ["src/tools/cargo", "library/backtrace", "library/stdarch"];
+            let rust_submodules = ["src/doc/book", "library/backtrace", "library/stdarch"];
             for s in rust_submodules {
                 build.update_submodule(Path::new(s));
             }
@@ -518,33 +490,27 @@ impl Build {
             return;
         }
 
-        // check_submodule
-        let checked_out_hash =
-            output(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&absolute_path));
-        // update_submodules
-        let recorded = output(
-            Command::new("git")
-                .args(["ls-tree", "HEAD"])
-                .arg(relative_path)
-                .current_dir(&self.config.src),
-        );
+        let submodule_git = || helpers::git(Some(&absolute_path));
+
+        // Determine commit checked out in submodule.
+        let checked_out_hash = output(submodule_git().args(["rev-parse", "HEAD"]));
+        let checked_out_hash = checked_out_hash.trim_end();
+        // Determine commit that the submodule *should* have.
+        let recorded =
+            output(helpers::git(Some(&self.src)).args(["ls-tree", "HEAD"]).arg(relative_path));
         let actual_hash = recorded
             .split_whitespace()
             .nth(2)
             .unwrap_or_else(|| panic!("unexpected output `{}`", recorded));
 
-        // update_submodule
-        if actual_hash == checked_out_hash.trim_end() {
+        if actual_hash == checked_out_hash {
             // already checked out
             return;
         }
 
         println!("Updating submodule {}", relative_path.display());
         self.run(
-            Command::new("git")
-                .args(["submodule", "-q", "sync"])
-                .arg(relative_path)
-                .current_dir(&self.config.src),
+            helpers::git(Some(&self.src)).args(["submodule", "-q", "sync"]).arg(relative_path),
         );
 
         // Try passing `--progress` to start, then run git again without if that fails.
@@ -552,9 +518,7 @@ impl Build {
             // Git is buggy and will try to fetch submodules from the tracking branch for *this* repository,
             // even though that has no relation to the upstream for the submodule.
             let current_branch = {
-                let output = self
-                    .config
-                    .git()
+                let output = helpers::git(Some(&self.src))
                     .args(["symbolic-ref", "--short", "HEAD"])
                     .stderr(Stdio::inherit())
                     .output();
@@ -566,7 +530,7 @@ impl Build {
                 }
             };
 
-            let mut git = self.config.git();
+            let mut git = helpers::git(Some(&self.src));
             if let Some(branch) = current_branch {
                 // If there is a tag named after the current branch, git will try to disambiguate by prepending `heads/` to the branch name.
                 // This syntax isn't accepted by `branch.{branch}`. Strip it.
@@ -582,32 +546,26 @@ impl Build {
         };
         // NOTE: doesn't use `try_run` because this shouldn't print an error if it fails.
         if !update(true).status().map_or(false, |status| status.success()) {
-            self.run(&mut update(false));
+            self.run(update(false));
         }
 
         // Save any local changes, but avoid running `git stash pop` if there are none (since it will exit with an error).
         // diff-index reports the modifications through the exit status
-        let has_local_modifications = !self.run_cmd(
-            BootstrapCommand::from(
-                Command::new("git")
-                    .args(["diff-index", "--quiet", "HEAD"])
-                    .current_dir(&absolute_path),
+        let has_local_modifications = self
+            .run(
+                BootstrapCommand::from(submodule_git().args(["diff-index", "--quiet", "HEAD"]))
+                    .allow_failure(),
             )
-            .allow_failure()
-            .output_mode(match self.is_verbose() {
-                true => OutputMode::PrintAll,
-                false => OutputMode::PrintOutput,
-            }),
-        );
+            .is_failure();
         if has_local_modifications {
-            self.run(Command::new("git").args(["stash", "push"]).current_dir(&absolute_path));
+            self.run(submodule_git().args(["stash", "push"]));
         }
 
-        self.run(Command::new("git").args(["reset", "-q", "--hard"]).current_dir(&absolute_path));
-        self.run(Command::new("git").args(["clean", "-qdfx"]).current_dir(&absolute_path));
+        self.run(submodule_git().args(["reset", "-q", "--hard"]));
+        self.run(submodule_git().args(["clean", "-qdfx"]));
 
         if has_local_modifications {
-            self.run(Command::new("git").args(["stash", "pop"]).current_dir(absolute_path));
+            self.run(submodule_git().args(["stash", "pop"]));
         }
     }
 
@@ -619,10 +577,9 @@ impl Build {
             return;
         }
         let output = output(
-            self.config
-                .git()
+            helpers::git(Some(&self.src))
                 .args(["config", "--file"])
-                .arg(&self.config.src.join(".gitmodules"))
+                .arg(self.config.src.join(".gitmodules"))
                 .args(["--get-regexp", "path"]),
         );
         for line in output.lines() {
@@ -659,15 +616,19 @@ impl Build {
 
         // hardcoded subcommands
         match &self.config.cmd {
-            Subcommand::Format { check } => {
+            Subcommand::Format { check, all } => {
                 return core::build_steps::format::format(
                     &builder::Builder::new(self),
                     *check,
+                    *all,
                     &self.config.paths,
                 );
             }
             Subcommand::Suggest { run } => {
                 return core::build_steps::suggest::suggest(&builder::Builder::new(self), *run);
+            }
+            Subcommand::Perf { .. } => {
+                return core::build_steps::perf::perf(&builder::Builder::new(self));
             }
             _ => (),
         }
@@ -947,7 +908,7 @@ impl Build {
     }
 
     /// Adds the `RUST_TEST_THREADS` env var if necessary
-    fn add_rust_test_threads(&self, cmd: &mut Command) {
+    fn add_rust_test_threads(&self, cmd: &mut BootstrapCommand) {
         if env::var_os("RUST_TEST_THREADS").is_none() {
             cmd.env("RUST_TEST_THREADS", self.jobs().to_string());
         }
@@ -968,73 +929,39 @@ impl Build {
         })
     }
 
-    /// Runs a command, printing out nice contextual information if it fails.
-    fn run(&self, cmd: &mut Command) {
-        self.run_cmd(BootstrapCommand::from(cmd).fail_fast().output_mode(
-            match self.is_verbose() {
-                true => OutputMode::PrintAll,
-                false => OutputMode::PrintOutput,
-            },
-        ));
-    }
-
-    /// Runs a command, printing out contextual info if it fails, and delaying errors until the build finishes.
-    pub(crate) fn run_delaying_failure(&self, cmd: &mut Command) -> bool {
-        self.run_cmd(BootstrapCommand::from(cmd).delay_failure().output_mode(
-            match self.is_verbose() {
-                true => OutputMode::PrintAll,
-                false => OutputMode::PrintOutput,
-            },
-        ))
-    }
-
-    /// Runs a command, printing out nice contextual information if it fails.
-    fn run_quiet(&self, cmd: &mut Command) {
-        self.run_cmd(
-            BootstrapCommand::from(cmd).fail_fast().output_mode(OutputMode::SuppressOnSuccess),
-        );
-    }
-
-    /// Runs a command, printing out nice contextual information if it fails.
-    /// Exits if the command failed to execute at all, otherwise returns its
-    /// `status.success()`.
-    fn run_quiet_delaying_failure(&self, cmd: &mut Command) -> bool {
-        self.run_cmd(
-            BootstrapCommand::from(cmd).delay_failure().output_mode(OutputMode::SuppressOnSuccess),
-        )
-    }
-
-    /// A centralized function for running commands that do not return output.
-    pub(crate) fn run_cmd<'a, C: Into<BootstrapCommand<'a>>>(&self, cmd: C) -> bool {
+    /// Execute a command and return its output.
+    /// This method should be used for all command executions in bootstrap.
+    fn run<C: Into<BootstrapCommand>>(&self, command: C) -> CommandOutput {
         if self.config.dry_run() {
-            return true;
+            return CommandOutput::default();
         }
 
-        let command = cmd.into();
+        let mut command = command.into();
+
         self.verbose(|| println!("running: {command:?}"));
 
-        let (output, print_error) = match command.output_mode {
-            mode @ (OutputMode::PrintAll | OutputMode::PrintOutput) => (
-                command.command.status().map(|status| Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }),
-                matches!(mode, OutputMode::PrintAll),
+        let output_mode = command.output_mode.unwrap_or_else(|| match self.is_verbose() {
+            true => OutputMode::All,
+            false => OutputMode::OnlyOutput,
+        });
+        let (output, print_error): (io::Result<CommandOutput>, bool) = match output_mode {
+            mode @ (OutputMode::All | OutputMode::OnlyOutput) => (
+                command.command.status().map(|status| status.into()),
+                matches!(mode, OutputMode::All),
             ),
-            OutputMode::SuppressOnSuccess => (command.command.output(), true),
+            OutputMode::OnlyOnFailure => (command.command.output().map(|o| o.into()), true),
         };
 
         let output = match output {
             Ok(output) => output,
             Err(e) => fail(&format!("failed to execute command: {:?}\nerror: {}", command, e)),
         };
-        let result = if !output.status.success() {
+        if !output.is_success() {
             if print_error {
                 println!(
                     "\n\nCommand did not execute successfully.\
-                    \nExpected success, got: {}",
-                    output.status,
+                \nExpected success, got: {}",
+                    output.status(),
                 );
 
                 if !self.is_verbose() {
@@ -1044,37 +971,29 @@ impl Build {
                 self.verbose(|| {
                     println!(
                         "\nSTDOUT ----\n{}\n\
-                        STDERR ----\n{}\n",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
+                    STDERR ----\n{}\n",
+                        output.stdout(),
+                        output.stderr(),
                     )
                 });
             }
-            Err(())
-        } else {
-            Ok(())
-        };
 
-        match result {
-            Ok(_) => true,
-            Err(_) => {
-                match command.failure_behavior {
-                    BehaviorOnFailure::DelayFail => {
-                        if self.fail_fast {
-                            exit!(1);
-                        }
-
-                        let mut failures = self.delayed_failures.borrow_mut();
-                        failures.push(format!("{command:?}"));
-                    }
-                    BehaviorOnFailure::Exit => {
+            match command.failure_behavior {
+                BehaviorOnFailure::DelayFail => {
+                    if self.fail_fast {
                         exit!(1);
                     }
-                    BehaviorOnFailure::Ignore => {}
+
+                    let mut failures = self.delayed_failures.borrow_mut();
+                    failures.push(format!("{command:?}"));
                 }
-                false
+                BehaviorOnFailure::Exit => {
+                    exit!(1);
+                }
+                BehaviorOnFailure::Ignore => {}
             }
         }
+        output
     }
 
     /// Check if verbosity is greater than the `level`
@@ -1560,10 +1479,14 @@ impl Build {
             // Figure out how many merge commits happened since we branched off master.
             // That's our beta number!
             // (Note that we use a `..` range, not the `...` symmetric difference.)
-            output(self.config.git().arg("rev-list").arg("--count").arg("--merges").arg(format!(
-                "refs/remotes/origin/{}..HEAD",
-                self.config.stage0_metadata.config.nightly_branch
-            )))
+            output(
+                helpers::git(Some(&self.src)).arg("rev-list").arg("--count").arg("--merges").arg(
+                    format!(
+                        "refs/remotes/origin/{}..HEAD",
+                        self.config.stage0_metadata.config.nightly_branch
+                    ),
+                ),
+            )
         });
         let n = count.trim().parse().unwrap();
         self.prerelease_version.set(Some(n));
@@ -1981,15 +1904,13 @@ fn envify(s: &str) -> String {
 /// In case of errors during `git` command execution (e.g., in tarball sources), default values
 /// are used to prevent panics.
 pub fn generate_smart_stamp_hash(dir: &Path, additional_input: &str) -> String {
-    let diff = Command::new("git")
-        .current_dir(dir)
+    let diff = helpers::git(Some(dir))
         .arg("diff")
         .output()
         .map(|o| String::from_utf8(o.stdout).unwrap_or_default())
         .unwrap_or_default();
 
-    let status = Command::new("git")
-        .current_dir(dir)
+    let status = helpers::git(Some(dir))
         .arg("status")
         .arg("--porcelain")
         .arg("-z")

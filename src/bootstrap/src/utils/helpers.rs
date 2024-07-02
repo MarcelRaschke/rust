@@ -18,7 +18,7 @@ use crate::core::builder::Builder;
 use crate::core::config::{Config, TargetSelection};
 use crate::LldMode;
 
-pub use crate::utils::dylib::{dylib_path, dylib_path_var};
+pub use crate::utils::shared_helpers::{dylib_path, dylib_path_var};
 
 #[cfg(test)]
 mod tests;
@@ -47,10 +47,11 @@ macro_rules! t {
         }
     };
 }
+use crate::utils::exec::BootstrapCommand;
 pub use t;
 
 pub fn exe(name: &str, target: TargetSelection) -> String {
-    crate::utils::dylib::exe(name, &target.triple)
+    crate::utils::shared_helpers::exe(name, &target.triple)
 }
 
 /// Returns `true` if the file name given looks like a dynamic library.
@@ -72,7 +73,7 @@ pub fn libdir(target: TargetSelection) -> &'static str {
 
 /// Adds a list of lookup paths to `cmd`'s dynamic library lookup path.
 /// If the dylib_path_var is already set for this cmd, the old value will be overwritten!
-pub fn add_dylib_path(path: Vec<PathBuf>, cmd: &mut Command) {
+pub fn add_dylib_path(path: Vec<PathBuf>, cmd: &mut BootstrapCommand) {
     let mut list = dylib_path();
     for path in path {
         list.insert(0, path);
@@ -81,7 +82,7 @@ pub fn add_dylib_path(path: Vec<PathBuf>, cmd: &mut Command) {
 }
 
 /// Adds a list of lookup paths to `cmd`'s link library lookup path.
-pub fn add_link_lib_path(path: Vec<PathBuf>, cmd: &mut Command) {
+pub fn add_link_lib_path(path: Vec<PathBuf>, cmd: &mut BootstrapCommand) {
     let mut list = link_lib_path();
     for path in path {
         list.insert(0, path);
@@ -135,7 +136,7 @@ pub fn symlink_dir(config: &Config, original: &Path, link: &Path) -> io::Result<
     if config.dry_run() {
         return Ok(());
     }
-    let _ = fs::remove_dir(link);
+    let _ = fs::remove_dir_all(link);
     return symlink_dir_inner(original, link);
 
     #[cfg(not(windows))]
@@ -241,8 +242,9 @@ pub fn is_valid_test_suite_arg<'a, P: AsRef<Path>>(
     }
 }
 
-pub fn check_run(cmd: &mut Command, print_cmd_on_fail: bool) -> bool {
-    let status = match cmd.status() {
+// FIXME: get rid of this function
+pub fn check_run(cmd: &mut BootstrapCommand, print_cmd_on_fail: bool) -> bool {
+    let status = match cmd.command.status() {
         Ok(status) => status,
         Err(e) => {
             println!("failed to execute command: {cmd:?}\nERROR: {e}");
@@ -329,115 +331,6 @@ fn dir_up_to_date(src: &Path, threshold: SystemTime) -> bool {
             meta.modified().unwrap_or(UNIX_EPOCH) < threshold
         }
     })
-}
-
-/// Copied from `std::path::absolute` until it stabilizes.
-///
-/// FIXME: this shouldn't exist.
-pub(crate) fn absolute(path: &Path) -> PathBuf {
-    if path.as_os_str().is_empty() {
-        panic!("can't make empty path absolute");
-    }
-    #[cfg(unix)]
-    {
-        t!(absolute_unix(path), format!("could not make path absolute: {}", path.display()))
-    }
-    #[cfg(windows)]
-    {
-        t!(absolute_windows(path), format!("could not make path absolute: {}", path.display()))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        println!("WARNING: bootstrap is not supported on non-unix platforms");
-        t!(std::fs::canonicalize(t!(std::env::current_dir()))).join(path)
-    }
-}
-
-#[cfg(unix)]
-/// Make a POSIX path absolute without changing its semantics.
-fn absolute_unix(path: &Path) -> io::Result<PathBuf> {
-    // This is mostly a wrapper around collecting `Path::components`, with
-    // exceptions made where this conflicts with the POSIX specification.
-    // See 4.13 Pathname Resolution, IEEE Std 1003.1-2017
-    // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13
-
-    use std::os::unix::prelude::OsStrExt;
-    let mut components = path.components();
-    let path_os = path.as_os_str().as_bytes();
-
-    let mut normalized = if path.is_absolute() {
-        // "If a pathname begins with two successive <slash> characters, the
-        // first component following the leading <slash> characters may be
-        // interpreted in an implementation-defined manner, although more than
-        // two leading <slash> characters shall be treated as a single <slash>
-        // character."
-        if path_os.starts_with(b"//") && !path_os.starts_with(b"///") {
-            components.next();
-            PathBuf::from("//")
-        } else {
-            PathBuf::new()
-        }
-    } else {
-        env::current_dir()?
-    };
-    normalized.extend(components);
-
-    // "Interfaces using pathname resolution may specify additional constraints
-    // when a pathname that does not name an existing directory contains at
-    // least one non- <slash> character and contains one or more trailing
-    // <slash> characters".
-    // A trailing <slash> is also meaningful if "a symbolic link is
-    // encountered during pathname resolution".
-
-    if path_os.ends_with(b"/") {
-        normalized.push("");
-    }
-
-    Ok(normalized)
-}
-
-#[cfg(windows)]
-fn absolute_windows(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    use std::ffi::OsString;
-    use std::io::Error;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::ptr::null_mut;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFullPathNameW(
-            lpFileName: *const u16,
-            nBufferLength: u32,
-            lpBuffer: *mut u16,
-            lpFilePart: *mut *const u16,
-        ) -> u32;
-    }
-
-    unsafe {
-        // encode the path as UTF-16
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let mut buffer = Vec::new();
-        // Loop until either success or failure.
-        loop {
-            // Try to get the absolute path
-            let len = GetFullPathNameW(
-                path.as_ptr(),
-                buffer.len().try_into().unwrap(),
-                buffer.as_mut_ptr(),
-                null_mut(),
-            );
-            match len as usize {
-                // Failure
-                0 => return Err(Error::last_os_error()),
-                // Buffer is too small, resize.
-                len if len > buffer.len() => buffer.resize(len, 0),
-                // Success!
-                len => {
-                    buffer.truncate(len);
-                    return Ok(OsString::from_wide(&buffer).into());
-                }
-            }
-        }
-    }
 }
 
 /// Adapted from <https://github.com/llvm/llvm-project/blob/782e91224601e461c019e0a4573bbccc6094fbcd/llvm/cmake/modules/HandleLLVMOptions.cmake#L1058-L1079>
@@ -546,7 +439,7 @@ pub fn linker_flags(
 }
 
 pub fn add_rustdoc_cargo_linker_args(
-    cmd: &mut Command,
+    cmd: &mut BootstrapCommand,
     builder: &Builder<'_>,
     target: TargetSelection,
     lld_threads: LldThreads,
@@ -597,4 +490,30 @@ pub fn check_cfg_arg(name: &str, values: Option<&[&str]>) -> String {
         None => "".to_string(),
     };
     format!("--check-cfg=cfg({name}{next})")
+}
+
+/// Prepares `Command` that runs git inside the source directory if given.
+///
+/// Whenever a git invocation is needed, this function should be preferred over
+/// manually building a git `Command`. This approach allows us to manage bootstrap-specific
+/// needs/hacks from a single source, rather than applying them on next to every `Command::new("git")`,
+/// which is painful to ensure that the required change is applied on each one of them correctly.
+pub fn git(source_dir: Option<&Path>) -> Command {
+    let mut git = Command::new("git");
+
+    if let Some(source_dir) = source_dir {
+        git.current_dir(source_dir);
+        // If we are running inside git (e.g. via a hook), `GIT_DIR` is set and takes precedence
+        // over the current dir. Un-set it to make the current dir matter.
+        git.env_remove("GIT_DIR");
+        // Also un-set some other variables, to be on the safe side (based on cargo's
+        // `fetch_with_cli`). In particular un-setting `GIT_INDEX_FILE` is required to fix some odd
+        // misbehavior.
+        git.env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    }
+
+    git
 }

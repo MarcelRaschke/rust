@@ -24,6 +24,7 @@ use crate::{
     consteval,
     db::{InternedClosure, InternedCoroutine},
     error_lifetime,
+    generics::{generics, Generics},
     infer::{
         coerce::{CoerceMany, CoercionCause},
         find_continuable,
@@ -39,7 +40,6 @@ use crate::{
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
-    utils::{generics, Generics},
     Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, FnAbi, FnPointer, FnSig,
     FnSubst, Interner, Rawness, Scalar, Substitution, TraitEnvironment, TraitRef, Ty, TyBuilder,
     TyExt, TyKind,
@@ -563,6 +563,7 @@ impl InferenceContext<'_> {
                                                 InferenceDiagnostic::NoSuchField {
                                                     field: field.expr.into(),
                                                     private: true,
+                                                    variant: def,
                                                 },
                                             );
                                         }
@@ -572,6 +573,7 @@ impl InferenceContext<'_> {
                                         self.push_diagnostic(InferenceDiagnostic::NoSuchField {
                                             field: field.expr.into(),
                                             private: false,
+                                            variant: def,
                                         });
                                         None
                                     }
@@ -931,8 +933,24 @@ impl InferenceContext<'_> {
         let prev_ret_coercion =
             mem::replace(&mut self.return_coercion, Some(CoerceMany::new(ret_ty.clone())));
 
+        // FIXME: We should handle async blocks like we handle closures
+        let expected = &Expectation::has_type(ret_ty);
         let (_, inner_ty) = self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-            this.infer_block(tgt_expr, *id, statements, *tail, None, &Expectation::has_type(ret_ty))
+            let ty = this.infer_block(tgt_expr, *id, statements, *tail, None, expected);
+            if let Some(target) = expected.only_has_type(&mut this.table) {
+                match this.coerce(Some(tgt_expr), &ty, &target) {
+                    Ok(res) => res,
+                    Err(_) => {
+                        this.result.type_mismatches.insert(
+                            tgt_expr.into(),
+                            TypeMismatch { expected: target.clone(), actual: ty.clone() },
+                        );
+                        target
+                    }
+                }
+            } else {
+                ty
+            }
         });
 
         self.diverges = prev_diverges;
@@ -1812,13 +1830,13 @@ impl InferenceContext<'_> {
     ) -> Substitution {
         let (
             parent_params,
-            self_params,
+            has_self_param,
             type_params,
             const_params,
             impl_trait_params,
             lifetime_params,
         ) = def_generics.provenance_split();
-        assert_eq!(self_params, 0); // method shouldn't have another Self param
+        assert!(!has_self_param); // method shouldn't have another Self param
         let total_len =
             parent_params + type_params + const_params + impl_trait_params + lifetime_params;
         let mut substs = Vec::with_capacity(total_len);
@@ -1826,13 +1844,11 @@ impl InferenceContext<'_> {
         // handle provided arguments
         if let Some(generic_args) = generic_args {
             // if args are provided, it should be all of them, but we can't rely on that
-            for (arg, kind_id) in generic_args
-                .args
-                .iter()
-                .take(type_params + const_params + lifetime_params)
-                .zip(def_generics.iter_id())
+            let self_params = type_params + const_params + lifetime_params;
+            for (arg, kind_id) in
+                generic_args.args.iter().zip(def_generics.iter_self_id()).take(self_params)
             {
-                if let Some(g) = generic_arg_to_chalk(
+                let arg = generic_arg_to_chalk(
                     self.db,
                     kind_id,
                     arg,
@@ -1851,9 +1867,8 @@ impl InferenceContext<'_> {
                         )
                     },
                     |this, lt_ref| this.make_lifetime(lt_ref),
-                ) {
-                    substs.push(g);
-                }
+                );
+                substs.push(arg);
             }
         };
 

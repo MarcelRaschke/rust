@@ -1,7 +1,9 @@
-#![cfg_attr(feature = "nightly", feature(step_trait))]
+// tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", doc(rust_logo))]
 #![cfg_attr(feature = "nightly", feature(rustdoc_internals))]
+#![cfg_attr(feature = "nightly", feature(step_trait))]
+// tidy-alphabetical-end
 
 use std::fmt;
 use std::num::{NonZeroUsize, ParseIntError};
@@ -137,23 +139,16 @@ impl ReprOptions {
         self.c() || self.int.is_some()
     }
 
-    /// Returns `true` if this `#[repr()]` should inhibit struct field reordering
-    /// optimizations, such as with `repr(C)`, `repr(packed(1))`, or `repr(<int>)`.
-    pub fn inhibit_struct_field_reordering_opt(&self) -> bool {
-        if let Some(pack) = self.pack {
-            if pack.bytes() == 1 {
-                return true;
-            }
-        }
-
+    /// Returns `true` if this `#[repr()]` guarantees a fixed field order,
+    /// e.g. `repr(C)` or `repr(<int>)`.
+    pub fn inhibit_struct_field_reordering(&self) -> bool {
         self.flags.intersects(ReprFlags::IS_UNOPTIMISABLE) || self.int.is_some()
     }
 
     /// Returns `true` if this type is valid for reordering and `-Z randomize-layout`
     /// was enabled for its declaration crate.
     pub fn can_randomize_type_layout(&self) -> bool {
-        !self.inhibit_struct_field_reordering_opt()
-            && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
+        !self.inhibit_struct_field_reordering() && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
     }
 
     /// Returns `true` if this `#[repr()]` should inhibit union ABI optimisations.
@@ -432,11 +427,13 @@ pub struct Size {
     raw: u64,
 }
 
-// Safety: Ord is implement as just comparing numerical values and numerical values
-// are not changed by (de-)serialization.
 #[cfg(feature = "nightly")]
-unsafe impl StableOrd for Size {
+impl StableOrd for Size {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `Ord` is implemented as just comparing numerical values and numerical values
+    // are not changed by (de-)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 // This is debug-printed a lot in larger structs, don't waste too much space there

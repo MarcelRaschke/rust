@@ -170,7 +170,7 @@ impl<'tcx> TypeInformationCtxt<'tcx> for &FnCtxt<'_, 'tcx> {
     }
 
     fn report_error(&self, span: Span, msg: impl ToString) -> Self::Error {
-        self.tcx.dcx().span_delayed_bug(span, msg.to_string())
+        self.dcx().span_delayed_bug(span, msg.to_string())
     }
 
     fn error_reported_in_ty(&self, ty: Ty<'tcx>) -> Result<(), Self::Error> {
@@ -1741,7 +1741,11 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             }
 
             PatKind::Slice(before, ref slice, after) => {
-                let Some(element_ty) = place_with_id.place.ty().builtin_index() else {
+                let Some(element_ty) = self
+                    .cx
+                    .try_structurally_resolve_type(pat.span, place_with_id.place.ty())
+                    .builtin_index()
+                else {
                     debug!("explicit index of non-indexable type {:?}", place_with_id);
                     return Err(self
                         .cx

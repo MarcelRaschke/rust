@@ -8,7 +8,6 @@
 )]
 
 // Some "regular" crates we want to share with rustc
-#[macro_use]
 extern crate tracing;
 
 // The rustc crates we need
@@ -25,6 +24,8 @@ use std::env::{self, VarError};
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+use tracing::debug;
 
 use rustc_data_structures::sync::Lrc;
 use rustc_driver::Compilation;
@@ -97,10 +98,9 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             }
 
             if tcx.sess.opts.optimize != OptLevel::No {
-                tcx.dcx().warn("Miri does not support optimizations. If you have enabled optimizations \
-                    by selecting a Cargo profile (such as --release) which changes other profile settings \
-                    such as whether debug assertions and overflow checks are enabled, those settings are \
-                    still applied.");
+                tcx.dcx().warn("Miri does not support optimizations: the opt-level is ignored. The only effect \
+                    of selecting a Cargo profile that enables optimizations (such as --release) is to apply \
+                    its remaining settings, such as whether debug assertions and overflow checks are enabled.");
             }
             if tcx.sess.mir_opt_level() > 0 {
                 tcx.dcx().warn("You have explicitly enabled MIR optimizations, overriding Miri's default \
@@ -405,9 +405,12 @@ fn main() {
 
     let mut rustc_args = vec![];
     let mut after_dashdash = false;
-
     // If user has explicitly enabled/disabled isolation
     let mut isolation_enabled: Option<bool> = None;
+
+    // Note that we require values to be given with `=`, not with a space.
+    // This matches how rustc parses `-Z`.
+    // However, unlike rustc we do not accept a space after `-Z`.
     for arg in args {
         if rustc_args.is_empty() {
             // Very first arg: binary name.

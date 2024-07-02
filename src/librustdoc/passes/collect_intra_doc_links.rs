@@ -12,7 +12,7 @@ use rustc_errors::{Applicability, Diag, DiagMessage};
 use rustc_hir::def::Namespace::*;
 use rustc_hir::def::{DefKind, Namespace, PerNS};
 use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
-use rustc_hir::Mutability;
+use rustc_hir::{Mutability, Safety};
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_middle::{bug, span_bug, ty};
 use rustc_resolve::rustdoc::{has_primitive_or_keyword_docs, prepare_to_doc_link_resolution};
@@ -1507,6 +1507,15 @@ impl Disambiguator {
     fn from_str(link: &str) -> Result<Option<(Self, &str, &str)>, (String, Range<usize>)> {
         use Disambiguator::{Kind, Namespace as NS, Primitive};
 
+        let suffixes = [
+            // If you update this list, please also update the relevant rustdoc book section!
+            ("!()", DefKind::Macro(MacroKind::Bang)),
+            ("!{}", DefKind::Macro(MacroKind::Bang)),
+            ("![]", DefKind::Macro(MacroKind::Bang)),
+            ("()", DefKind::Fn),
+            ("!", DefKind::Macro(MacroKind::Bang)),
+        ];
+
         if let Some(idx) = link.find('@') {
             let (prefix, rest) = link.split_at(idx);
             let d = match prefix {
@@ -1517,7 +1526,11 @@ impl Disambiguator {
                 "union" => Kind(DefKind::Union),
                 "module" | "mod" => Kind(DefKind::Mod),
                 "const" | "constant" => Kind(DefKind::Const),
-                "static" => Kind(DefKind::Static { mutability: Mutability::Not, nested: false }),
+                "static" => Kind(DefKind::Static {
+                    mutability: Mutability::Not,
+                    nested: false,
+                    safety: Safety::Safe,
+                }),
                 "function" | "fn" | "method" => Kind(DefKind::Fn),
                 "derive" => Kind(DefKind::Macro(MacroKind::Derive)),
                 "type" => NS(Namespace::TypeNS),
@@ -1526,16 +1539,23 @@ impl Disambiguator {
                 "prim" | "primitive" => Primitive,
                 _ => return Err((format!("unknown disambiguator `{prefix}`"), 0..idx)),
             };
+
+            for (suffix, kind) in suffixes {
+                if let Some(path_str) = rest.strip_suffix(suffix) {
+                    if d.ns() != Kind(kind).ns() {
+                        return Err((
+                            format!("unmatched disambiguator `{prefix}` and suffix `{suffix}`"),
+                            0..idx,
+                        ));
+                    } else if path_str.len() > 1 {
+                        // path_str != "@"
+                        return Ok(Some((d, &path_str[1..], &rest[1..])));
+                    }
+                }
+            }
+
             Ok(Some((d, &rest[1..], &rest[1..])))
         } else {
-            let suffixes = [
-                // If you update this list, please also update the relevant rustdoc book section!
-                ("!()", DefKind::Macro(MacroKind::Bang)),
-                ("!{}", DefKind::Macro(MacroKind::Bang)),
-                ("![]", DefKind::Macro(MacroKind::Bang)),
-                ("()", DefKind::Fn),
-                ("!", DefKind::Macro(MacroKind::Bang)),
-            ];
             for (suffix, kind) in suffixes {
                 if let Some(path_str) = link.strip_suffix(suffix) {
                     // Avoid turning `!` or `()` into an empty string
@@ -1689,7 +1709,9 @@ fn report_diagnostic(
 
     let sp = item.attr_span(tcx);
 
-    tcx.node_span_lint(lint, hir_id, sp, msg, |lint| {
+    tcx.node_span_lint(lint, hir_id, sp, |lint| {
+        lint.primary_message(msg);
+
         let (span, link_range) = match link_range {
             MarkdownLinkRange::Destination(md_range) => {
                 let mut md_range = md_range.clone();

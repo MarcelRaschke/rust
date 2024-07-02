@@ -190,4 +190,14 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
         severity: ChangeSeverity::Warning,
         summary: "`rust.lld` has a new default value of `true` on `x86_64-unknown-linux-gnu`. Starting at stage1, `rust-lld` will thus be this target's default linker. No config changes should be necessary.",
     },
+    ChangeInfo {
+        change_id: 125535,
+        severity: ChangeSeverity::Warning,
+        summary: "Removed `dist.missing-tools` configuration as it was deprecated long time ago.",
+    },
+    ChangeInfo {
+        change_id: 126701,
+        severity: ChangeSeverity::Warning,
+        summary: "`llvm.lld` is enabled by default for the dist profile. If set to false, `lld` will not be included in the dist build.",
+    },
 ];

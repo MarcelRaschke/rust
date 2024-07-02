@@ -213,9 +213,9 @@
 //! [array]: prim@array
 //! [slice]: prim@slice
 
-#![cfg_attr(not(feature = "restricted-std"), stable(feature = "rust1", since = "1.0.0"))]
+#![cfg_attr(not(restricted_std), stable(feature = "rust1", since = "1.0.0"))]
 #![cfg_attr(
-    feature = "restricted-std",
+    restricted_std,
     unstable(
         feature = "restricted_std",
         issue = "none",
@@ -273,18 +273,17 @@
 //
 // Language features:
 // tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(c_unwind))]
 #![feature(alloc_error_handler)]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
 #![feature(asm_experimental_arch)]
-#![feature(c_unwind)]
 #![feature(cfg_sanitizer_cfi)]
 #![feature(cfg_target_thread_local)]
 #![feature(cfi_encoding)]
 #![feature(concat_idents)]
 #![feature(const_mut_refs)]
-#![feature(const_trait_impl)]
 #![feature(decl_macro)]
 #![feature(deprecated_suggestion)]
 #![feature(doc_cfg)]
@@ -324,7 +323,6 @@
 #![feature(core_io_borrowed_buf)]
 #![feature(duration_constants)]
 #![feature(error_generic_member_access)]
-#![feature(error_in_core)]
 #![feature(error_iter)]
 #![feature(exact_size_is_empty)]
 #![feature(exclusive_wrapper)]
@@ -339,10 +337,8 @@
 #![feature(hint_assert_unchecked)]
 #![feature(ip)]
 #![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_uninit_array)]
 #![feature(maybe_uninit_write_slice)]
 #![feature(panic_can_unwind)]
-#![feature(panic_info_message)]
 #![feature(panic_internals)]
 #![feature(pointer_is_aligned_to)]
 #![feature(portable_simd)]
@@ -395,7 +391,6 @@
 #![feature(edition_panic)]
 #![feature(format_args_nl)]
 #![feature(get_many_mut)]
-#![feature(lazy_cell)]
 #![feature(log_syntax)]
 #![feature(test)]
 #![feature(trace_macros)]
@@ -410,7 +405,6 @@
 #![feature(const_ip)]
 #![feature(const_ipv4)]
 #![feature(const_ipv6)]
-#![feature(const_maybe_uninit_uninit_array)]
 #![feature(const_waker)]
 #![feature(thread_local_internals)]
 // tidy-alphabetical-end
@@ -435,6 +429,7 @@ extern crate alloc as alloc_crate;
 // so include it here even if it's unused.
 #[doc(masked)]
 #[allow(unused_extern_crates)]
+#[cfg(not(all(windows, target_env = "msvc")))]
 extern crate libc;
 
 // We always need an unwinder currently for backtraces

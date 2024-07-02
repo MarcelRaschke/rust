@@ -74,7 +74,7 @@ fn integrated_highlighting_benchmark() {
         host.apply_change(change);
     }
 
-    let _g = crate::tracing::hprof::init("*>20");
+    let _g = crate::tracing::hprof::init("*>10");
 
     {
         let _it = stdx::timeit("after change");
@@ -139,6 +139,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -149,9 +150,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -159,7 +160,7 @@ fn integrated_completion_benchmark() {
         analysis.completions(&config, position, None).unwrap();
     }
 
-    let _g = crate::tracing::hprof::init("*");
+    let _g = crate::tracing::hprof::init("*>10");
 
     let completion_offset = {
         let _it = stdx::timeit("change");
@@ -174,7 +175,7 @@ fn integrated_completion_benchmark() {
     };
 
     {
-        let _p = tracing::span!(tracing::Level::INFO, "unqualified path completion").entered();
+        let _p = tracing::info_span!("unqualified path completion").entered();
         let _span = profile::cpu_span();
         let analysis = host.analysis();
         let config = CompletionConfig {
@@ -183,6 +184,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -193,9 +195,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -216,7 +218,7 @@ fn integrated_completion_benchmark() {
     };
 
     {
-        let _p = tracing::span!(tracing::Level::INFO, "dot completion").entered();
+        let _p = tracing::info_span!("dot completion").entered();
         let _span = profile::cpu_span();
         let analysis = host.analysis();
         let config = CompletionConfig {
@@ -225,6 +227,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -235,9 +238,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -286,6 +289,7 @@ fn integrated_diagnostics_benchmark() {
         disabled: Default::default(),
         expr_fill_default: Default::default(),
         style_lints: false,
+        snippet_cap: SnippetCap::new(true),
         insert_use: InsertUseConfig {
             granularity: ImportGranularity::Crate,
             enforce_granularity: false,
@@ -295,6 +299,7 @@ fn integrated_diagnostics_benchmark() {
         },
         prefer_no_std: false,
         prefer_prelude: false,
+        term_search_fuel: 400,
     };
     host.analysis()
         .diagnostics(&diagnostics_config, ide::AssistResolveStrategy::None, file_id)
@@ -312,7 +317,7 @@ fn integrated_diagnostics_benchmark() {
     };
 
     {
-        let _p = tracing::span!(tracing::Level::INFO, "diagnostics").entered();
+        let _p = tracing::info_span!("diagnostics").entered();
         let _span = profile::cpu_span();
         host.analysis()
             .diagnostics(&diagnostics_config, ide::AssistResolveStrategy::None, file_id)

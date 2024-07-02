@@ -152,7 +152,7 @@ extern "rust-intrinsic" {
     #[rustc_nounwind]
     pub fn simd_fabs<T>(x: T) -> T;
 
-    /// Elementwise minimum of a vector.
+    /// Elementwise minimum of two vectors.
     ///
     /// `T` must be a vector of floating-point primitive types.
     ///
@@ -160,7 +160,7 @@ extern "rust-intrinsic" {
     #[rustc_nounwind]
     pub fn simd_fmin<T>(x: T, y: T) -> T;
 
-    /// Elementwise maximum of a vector.
+    /// Elementwise maximum of two vectors.
     ///
     /// `T` must be a vector of floating-point primitive types.
     ///
@@ -262,9 +262,6 @@ extern "rust-intrinsic" {
     /// `U` must be a vector of pointers to the element type of `T`, with the same length as `T`.
     ///
     /// `V` must be a vector of integers with the same length as `T` (but any element size).
-    ///
-    /// `idx` must be a constant: either naming a constant item, or an inline
-    /// `const {}` expression.
     ///
     /// For each pointer in `ptr`, if the corresponding value in `mask` is `!0`, read the pointer.
     /// Otherwise if the corresponding value in `mask` is `0`, return the corresponding value from
@@ -387,7 +384,7 @@ extern "rust-intrinsic" {
     #[rustc_nounwind]
     pub fn simd_reduce_mul_ordered<T, U>(x: T, y: U) -> U;
 
-    /// Add elements within a vector in arbitrary order. May also be re-associated with
+    /// Multiply elements within a vector in arbitrary order. May also be re-associated with
     /// unordered additions on the inputs/outputs.
     ///
     /// `T` must be a vector of integer or floating-point primitive types.
@@ -405,7 +402,7 @@ extern "rust-intrinsic" {
     #[rustc_nounwind]
     pub fn simd_reduce_all<T>(x: T) -> bool;
 
-    /// Check if all mask values are true.
+    /// Check if any mask value is true.
     ///
     /// `T` must be a vector of integer primitive types.
     ///
@@ -568,6 +565,12 @@ extern "rust-intrinsic" {
     /// `T` must be a vector of integers.
     #[rustc_nounwind]
     pub fn simd_ctlz<T>(x: T) -> T;
+
+    /// Count the number of ones in each element.
+    ///
+    /// `T` must be a vector of integers.
+    #[rustc_nounwind]
+    pub fn simd_ctpop<T>(x: T) -> T;
 
     /// Count the trailing zeros of each element.
     ///

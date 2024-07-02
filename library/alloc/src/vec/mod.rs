@@ -1101,6 +1101,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[inline]
     pub fn shrink_to_fit(&mut self) {
         // The capacity is never less than the length, and there's nothing to do when
         // they are equal, so we can avoid the panic case in `RawVec::shrink_to_fit`
@@ -2643,15 +2644,13 @@ impl<T, A: Allocator, const N: usize> Vec<[T; N], A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(slice_flatten)]
-    ///
     /// let mut vec = vec![[1, 2, 3], [4, 5, 6], [7, 8, 9]];
     /// assert_eq!(vec.pop(), Some([7, 8, 9]));
     ///
     /// let mut flattened = vec.into_flattened();
     /// assert_eq!(flattened.pop(), Some(6));
     /// ```
-    #[unstable(feature = "slice_flatten", issue = "95629")]
+    #[stable(feature = "slice_flatten", since = "1.80.0")]
     pub fn into_flattened(self) -> Vec<T, A> {
         let (ptr, len, cap, alloc) = self.into_raw_parts_with_alloc();
         let (new_len, new_cap) = if T::IS_ZST {

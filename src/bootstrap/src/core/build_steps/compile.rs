@@ -27,6 +27,7 @@ use crate::core::builder::crate_description;
 use crate::core::builder::Cargo;
 use crate::core::builder::{Builder, Kind, PathSet, RunConfig, ShouldRun, Step, TaskPath};
 use crate::core::config::{DebuginfoLevel, LlvmLibunwind, RustcLto, TargetSelection};
+use crate::utils::exec::BootstrapCommand;
 use crate::utils::helpers::{
     exe, get_clang_cl_resource_dir, is_debug_info, is_dylib, output, symlink_dir, t, up_to_date,
 };
@@ -160,9 +161,10 @@ impl Step for Std {
             // This check is specific to testing std itself; see `test::Std` for more details.
             && !self.force_recompile
         {
+            let sysroot = builder.ensure(Sysroot { compiler, force_recompile: false });
             cp_rustc_component_to_ci_sysroot(
                 builder,
-                compiler,
+                &sysroot,
                 builder.config.ci_rust_std_contents(),
             );
             return;
@@ -771,7 +773,7 @@ impl Step for StartupObjects {
             let src_file = &src_dir.join(file.to_string() + ".rs");
             let dst_file = &dst_dir.join(file.to_string() + ".o");
             if !up_to_date(src_file, dst_file) {
-                let mut cmd = Command::new(&builder.initial_rustc);
+                let mut cmd = BootstrapCommand::new(&builder.initial_rustc);
                 cmd.env("RUSTC_BOOTSTRAP", "1");
                 if !builder.local_rebuild {
                     // a local_rebuild compiler already has stage1 features
@@ -796,12 +798,7 @@ impl Step for StartupObjects {
     }
 }
 
-fn cp_rustc_component_to_ci_sysroot(
-    builder: &Builder<'_>,
-    compiler: Compiler,
-    contents: Vec<String>,
-) {
-    let sysroot = builder.ensure(Sysroot { compiler, force_recompile: false });
+fn cp_rustc_component_to_ci_sysroot(builder: &Builder<'_>, sysroot: &Path, contents: Vec<String>) {
     let ci_rustc_dir = builder.config.ci_rustc_dir();
 
     for file in contents {
@@ -880,13 +877,7 @@ impl Step for Rustc {
         // NOTE: the ABI of the beta compiler is different from the ABI of the downloaded compiler,
         // so its artifacts can't be reused.
         if builder.download_rustc() && compiler.stage != 0 {
-            // Copy the existing artifacts instead of rebuilding them.
-            // NOTE: this path is only taken for tools linking to rustc-dev (including ui-fulldeps tests).
-            cp_rustc_component_to_ci_sysroot(
-                builder,
-                compiler,
-                builder.config.ci_rustc_dev_contents(),
-            );
+            builder.ensure(Sysroot { compiler, force_recompile: false });
             return compiler.stage;
         }
 
@@ -1008,10 +999,7 @@ pub fn rustc_cargo(
 
     // If the rustc output is piped to e.g. `head -n1` we want the process to be
     // killed, rather than having an error bubble up and cause a panic.
-    // FIXME: Synthetic #[cfg(bootstrap)]. Remove when the bootstrap compiler supports it.
-    if compiler.stage != 0 {
-        cargo.rustflag("-Zon-broken-pipe=kill");
-    }
+    cargo.rustflag("-Zon-broken-pipe=kill");
 
     // We currently don't support cross-crate LTO in stage0. This also isn't hugely necessary
     // and may just be a time sink.
@@ -1137,7 +1125,9 @@ pub fn rustc_cargo_env(
     }
 
     // Enable rustc's env var for `rust-lld` when requested.
-    if builder.config.lld_enabled {
+    if builder.config.lld_enabled
+        && (builder.config.channel == "dev" || builder.config.channel == "nightly")
+    {
         cargo.env("CFG_USE_SELF_CONTAINED_LINKER", "1");
     }
 
@@ -1291,15 +1281,21 @@ fn needs_codegen_config(run: &RunConfig<'_>) -> bool {
 pub(crate) const CODEGEN_BACKEND_PREFIX: &str = "rustc_codegen_";
 
 fn is_codegen_cfg_needed(path: &TaskPath, run: &RunConfig<'_>) -> bool {
-    if path.path.to_str().unwrap().contains(CODEGEN_BACKEND_PREFIX) {
+    let path = path.path.to_str().unwrap();
+
+    let is_explicitly_called = |p| -> bool { run.builder.paths.contains(p) };
+    let should_enforce = run.builder.kind == Kind::Dist || run.builder.kind == Kind::Install;
+
+    if path.contains(CODEGEN_BACKEND_PREFIX) {
         let mut needs_codegen_backend_config = true;
         for backend in run.builder.config.codegen_backends(run.target) {
-            if path.path.to_str().unwrap().ends_with(&(CODEGEN_BACKEND_PREFIX.to_owned() + backend))
-            {
+            if path.ends_with(&(CODEGEN_BACKEND_PREFIX.to_owned() + backend)) {
                 needs_codegen_backend_config = false;
             }
         }
-        if needs_codegen_backend_config {
+        if (is_explicitly_called(&PathBuf::from(path)) || should_enforce)
+            && needs_codegen_backend_config
+        {
             run.builder.info(
                 "WARNING: no codegen-backends config matched the requested path to build a codegen backend. \
                 HELP: add backend to codegen-backends in config.toml.",
@@ -1628,31 +1624,44 @@ impl Step for Sysroot {
         let sysroot_lib_rustlib_src_rust = sysroot_lib_rustlib_src.join("rust");
         if let Err(e) = symlink_dir(&builder.config, &builder.src, &sysroot_lib_rustlib_src_rust) {
             eprintln!(
-                "WARNING: creating symbolic link `{}` to `{}` failed with {}",
+                "ERROR: creating symbolic link `{}` to `{}` failed with {}",
                 sysroot_lib_rustlib_src_rust.display(),
                 builder.src.display(),
                 e,
             );
             if builder.config.rust_remap_debuginfo {
                 eprintln!(
-                    "WARNING: some `tests/ui` tests will fail when lacking `{}`",
+                    "ERROR: some `tests/ui` tests will fail when lacking `{}`",
                     sysroot_lib_rustlib_src_rust.display(),
                 );
             }
+            build_helper::exit!(1);
         }
-        // Same for the rustc-src component.
-        let sysroot_lib_rustlib_rustcsrc = sysroot.join("lib/rustlib/rustc-src");
-        t!(fs::create_dir_all(&sysroot_lib_rustlib_rustcsrc));
-        let sysroot_lib_rustlib_rustcsrc_rust = sysroot_lib_rustlib_rustcsrc.join("rust");
-        if let Err(e) =
-            symlink_dir(&builder.config, &builder.src, &sysroot_lib_rustlib_rustcsrc_rust)
-        {
-            eprintln!(
-                "WARNING: creating symbolic link `{}` to `{}` failed with {}",
-                sysroot_lib_rustlib_rustcsrc_rust.display(),
-                builder.src.display(),
-                e,
+
+        // Unlike rust-src component, we have to handle rustc-src a bit differently.
+        // When using CI rustc, we copy rustc-src component from its sysroot,
+        // otherwise we handle it in a similar way what we do for rust-src above.
+        if builder.download_rustc() {
+            cp_rustc_component_to_ci_sysroot(
+                builder,
+                &sysroot,
+                builder.config.ci_rustc_dev_contents(),
             );
+        } else {
+            let sysroot_lib_rustlib_rustcsrc = sysroot.join("lib/rustlib/rustc-src");
+            t!(fs::create_dir_all(&sysroot_lib_rustlib_rustcsrc));
+            let sysroot_lib_rustlib_rustcsrc_rust = sysroot_lib_rustlib_rustcsrc.join("rust");
+            if let Err(e) =
+                symlink_dir(&builder.config, &builder.src, &sysroot_lib_rustlib_rustcsrc_rust)
+            {
+                eprintln!(
+                    "ERROR: creating symbolic link `{}` to `{}` failed with {}",
+                    sysroot_lib_rustlib_rustcsrc_rust.display(),
+                    builder.src.display(),
+                    e,
+                );
+                build_helper::exit!(1);
+            }
         }
 
         sysroot
@@ -2071,7 +2080,7 @@ pub fn stream_cargo(
     tail_args: Vec<String>,
     cb: &mut dyn FnMut(CargoMessage<'_>),
 ) -> bool {
-    let mut cargo = Command::from(cargo);
+    let mut cargo = BootstrapCommand::from(cargo).command;
     // Instruct Cargo to give us json messages on stdout, critically leaving
     // stderr as piped so we can get those pretty colors.
     let mut message_format = if builder.config.json_output {
